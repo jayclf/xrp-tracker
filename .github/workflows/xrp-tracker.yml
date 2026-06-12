@@ -1,0 +1,63 @@
+name: XRP-USDT Price Action Tracker
+
+on:
+  schedule:
+    # 每15分钟执行一次 (UTC时间)
+    - cron: '*/15 * * * *'
+  workflow_dispatch: # 支持手动触发
+
+jobs:
+  tracker:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore prev_state cache
+        uses: actions/cache@v4
+        with:
+          path: output/prev_state.json
+          key: xrp-tracker-state-${{ github.run_id }}
+          restore-keys: |
+            xrp-tracker-state-
+
+      - name: Run XRP Tracker
+        env:
+          SC_SENDKEY: ${{ secrets.SC_SENDKEY }}
+          IMA_CLIENT_ID: ${{ secrets.IMA_CLIENT_ID }}
+          IMA_API_KEY: ${{ secrets.IMA_API_KEY }}
+          IMA_KB_ID: ${{ secrets.IMA_KB_ID }}
+          TRACKER_OUTPUT_DIR: output
+        run: python xrp_tracker.py
+
+      - name: Save prev_state cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: output/prev_state.json
+          key: xrp-tracker-state-${{ github.run_id }}
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tracker-report-${{ github.run_number }}
+          path: output/latest_report.txt
+          retention-days: 7

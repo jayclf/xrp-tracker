@@ -1,0 +1,683 @@
+#!/usr/bin/env python3
+"""
+XRP-USDT 价格行为跟踪分析脚本 (GitHub Actions 知识库增强版)
+
+架构: ima OpenAPI搜索知识库 -> 下载PDF解析 -> 规则引擎驱动分析逻辑
+分析: 1H确认趋势 -> 15M找回调结束点 -> 生成交易计划
+推送: ServerChan (urllib直接调用HTTP API)
+"""
+
+import json
+import urllib.request
+import urllib.error
+import urllib.parse
+import time
+import os
+import re
+import io
+import hashlib
+from datetime import datetime, timezone
+
+# ============================================================
+# 配置
+# ============================================================
+
+SC_SENDKEY = os.environ.get("SC_SENDKEY", "")
+
+IMA_CLIENT_ID = os.environ.get("IMA_CLIENT_ID", "")
+IMA_API_KEY = os.environ.get("IMA_API_KEY", "")
+IMA_KB_ID = os.environ.get("IMA_KB_ID", "")
+
+OUTPUT_DIR = os.environ.get("TRACKER_OUTPUT_DIR", os.path.join(os.getcwd(), "output"))
+
+# 知识库搜索关键词（按分析阶段分组）
+KB_SEARCH_QUERIES = {
+    "trend": ["趋势", "trend", "market structure", "swing"],
+    "pullback": ["回调", "pullback", "retracement"],
+    "signal": ["pin bar", "吞没", "engulfing", "price action pattern"],
+    "support_resistance": ["支撑阻力", "support resistance"],
+    "entry_exit": ["入场", "止损", "entry", "stop loss", "profit target"],
+}
+
+MAX_PDF_PER_CATEGORY = 3
+MAX_CHARS_PER_PDF = 5000
+
+# ============================================================
+# 日志
+# ============================================================
+
+log_lines = []
+
+
+def log(msg):
+    log_lines.append(msg)
+    print(msg)
+
+
+# ============================================================
+# CryptoCompare 数据获取
+# ============================================================
+
+def fetch_candles(symbol, interval, limit=200):
+    """从CryptoCompare获取K线数据"""
+    if interval == "1h":
+        endpoint = "histohour"
+        params = {"aggregate": 1}
+    elif interval == "15m":
+        endpoint = "histominute"
+        params = {"aggregate": 15}
+    else:
+        return []
+
+    all_candles = []
+    remaining = limit
+    ts = None
+
+    while remaining > 0:
+        batch = min(remaining, 2000)
+        p = {
+            "fsym": symbol.split("-")[0],
+            "tsym": symbol.split("-")[1],
+            "limit": batch,
+            **params,
+        }
+        if ts:
+            p["toTs"] = ts
+
+        url = f"https://min-api.cryptocompare.com/data/{endpoint}?{urllib.parse.urlencode(p)}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "XRPTracker/2.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            log(f"  CryptoCompare request failed: {e}")
+            break
+
+        candles = data.get("Data", [])
+        if not candles:
+            break
+
+        all_candles.extend(candles)
+        remaining -= len(candles)
+
+        if len(candles) < batch:
+            break
+
+        oldest_ts = min(c["time"] for c in candles)
+        ts = oldest_ts - 1
+
+    # 去重 + 排序 + 取最新limit根
+    seen = set()
+    unique = []
+    for c in reversed(all_candles):
+        t = c["time"]
+        if t not in seen:
+            seen.add(t)
+            unique.append(c)
+    unique.reverse()
+
+    return unique[-limit:] if len(unique) > limit else unique
+
+
+def parse_candles(raw):
+    """解析K线数据为标准格式"""
+    result = []
+    for c in raw:
+        result.append({
+            "time": c["time"],
+            "dt": datetime.fromtimestamp(c["time"], tz=timezone.utc).strftime("%m-%d %H:%M"),
+            "open": float(c["open"]),
+            "high": float(c["high"]),
+            "low": float(c["low"]),
+            "close": float(c["close"]),
+            "volume": float(c.get("volumeto", c.get("volume", 0))),
+        })
+    return result
+
+
+# ============================================================
+# ima OpenAPI 知识库集成
+# ============================================================
+
+def ima_request(endpoint, body):
+    """调用ima OpenAPI"""
+    url = f"https://ima.qq.com/openapi/wiki/v1/{endpoint}"
+    headers = {
+        "ima-openapi-clientid": IMA_CLIENT_ID,
+        "ima-openapi-apikey": IMA_API_KEY,
+        "Content-Type": "application/json",
+    }
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        if result.get("code") != 0:
+            log(f"  ima API error: {result.get('message', 'unknown')}")
+            return None
+        return result.get("data", result)
+    except Exception as e:
+        log(f"  ima API request failed: {e}")
+        return None
+
+
+def search_knowledge(query, top_k=5):
+    """搜索知识库"""
+    data = ima_request("search_knowledge", {
+        "knowledge_base_id": IMA_KB_ID,
+        "query": query,
+        "top_k": top_k,
+    })
+    if not data:
+        return []
+    results = []
+    items = data if isinstance(data, list) else data.get("list", data.get("results", []))
+    for item in items:
+        media_id = item.get("media_id", "")
+        title = item.get("title", item.get("name", ""))
+        if media_id:
+            results.append({"media_id": media_id, "title": title})
+    return results
+
+
+def download_pdf_text(media_id):
+    """下载PDF并解析: get_media_info -> download -> PyPDF2"""
+    if not IMA_CLIENT_ID or not IMA_API_KEY or not IMA_KB_ID:
+        return ""
+
+    data = ima_request("get_media_info", {
+        "media_id": media_id,
+        "knowledge_base_id": IMA_KB_ID,
+    })
+    if not data:
+        return ""
+
+    url_info = data.get("url_info", {})
+    download_url = url_info.get("url", "")
+    dl_headers = url_info.get("headers", {})
+
+    if not download_url:
+        return ""
+
+    try:
+        req = urllib.request.Request(download_url, headers=dl_headers)
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            pdf_data = resp.read()
+    except Exception as e:
+        log(f"  PDF download failed: {e}")
+        return ""
+
+    try:
+        import PyPDF2
+        reader = PyPDF2.PdfReader(io.BytesIO(pdf_data))
+        text = ""
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            text += page_text + "\n"
+        return text
+    except ImportError:
+        log("  PyPDF2 not installed, skip PDF parsing")
+        return ""
+    except Exception as e:
+        log(f"  PDF parse failed: {e}")
+        return ""
+
+
+def fetch_knowledge_rules():
+    """
+    从知识库搜索并提取交易规则文本
+    返回: dict[category] -> list[dict(title, text)]
+    每个类别独立计数下载PDF数量（修复原版全局计数Bug）
+    """
+    knowledge = {}
+    seen_media_ids = set()
+
+    log("\n--- Knowledge Base Rule Fetching ---")
+
+    if not IMA_CLIENT_ID or not IMA_API_KEY or not IMA_KB_ID:
+        log("  ima API credentials not configured, skip knowledge base")
+        return knowledge
+
+    for category, queries in KB_SEARCH_QUERIES.items():
+        category_docs = []
+        category_downloaded = 0  # 每个类别独立计数
+
+        for query in queries:
+            if category_downloaded >= MAX_PDF_PER_CATEGORY:
+                break
+
+            results = search_knowledge(query, top_k=3)
+            for item in results:
+                mid = item["media_id"]
+                if mid in seen_media_ids:
+                    continue
+                seen_media_ids.add(mid)
+
+                if category_downloaded >= MAX_PDF_PER_CATEGORY:
+                    break
+
+                log(f"  [{category}] Downloading: {item['title'][:50]}...")
+                text = download_pdf_text(mid)
+                if text:
+                    category_docs.append({
+                        "title": item["title"],
+                        "text": text[:MAX_CHARS_PER_PDF],
+                        "total_chars": len(text),
+                    })
+                    category_downloaded += 1
+                    log(f"    Got {len(text)} chars (using first {MAX_CHARS_PER_PDF})")
+
+        if category_docs:
+            knowledge[category] = category_docs
+
+    total_docs = sum(len(docs) for docs in knowledge.values())
+    total_chars = sum(sum(d["total_chars"] for d in docs) for docs in knowledge.values())
+    log(f"  Knowledge base: {len(knowledge)} categories, {total_docs} docs, {total_chars} chars")
+    for cat, docs in knowledge.items():
+        chars = sum(d["total_chars"] for d in docs)
+        log(f"    - {cat}: {len(docs)} docs, {chars} chars")
+
+    return knowledge
+
+
+# ============================================================
+# 知识库规则提取引擎
+# ============================================================
+
+def extract_rules_from_text(text, category):
+    """从知识库文本中提取结构化规则"""
+    rules = []
+
+    # 通用规则提取模式
+    patterns = [
+        # 编号规则: "1. xxx" "2. xxx"
+        r'(?:^|\n)\s*(?:\d+[\.、）)]|[一二三四五六七八九十]+[、）)])\s*(.+)',
+        # 条件规则: "如果...则/就/应该..."
+        r'(?:^|\n)\s*(?:如果|若|当|一旦).+?(?:则|就|应该|需|必须|要).+',
+        # 关键规则: "必须/应该/需要/一定要..."
+        r'(?:^|\n)\s*(?:必须|应该|需要|一定要|务必|切记|注意).+',
+        # 禁止规则: "不要/不能/不可/避免/禁止/切勿..."
+        r'(?:^|\n)\s*(?:不要|不能|不可|避免|禁止|切勿|绝不|绝不能).+',
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        for match in matches:
+            rule = match.strip() if isinstance(match, str) else match[0].strip()
+            if len(rule) > 5 and len(rule) < 200:
+                rules.append(rule)
+
+    # 去重
+    seen = set()
+    unique_rules = []
+    for r in rules:
+        r_clean = re.sub(r'\s+', '', r)
+        if r_clean not in seen:
+            seen.add(r_clean)
+            unique_rules.append(r)
+
+    return unique_rules[:10]  # 每个文档最多10条规则
+
+
+def build_rule_engine(knowledge):
+    """
+    从知识库内容构建规则引擎
+    返回: dict[category] -> list[dict(rule, source)]
+    """
+    rule_engine = {}
+
+    for category, docs in knowledge.items():
+        category_rules = []
+        for doc in docs:
+            extracted = extract_rules_from_text(doc["text"], category)
+            for rule in extracted:
+                category_rules.append({
+                    "rule": rule,
+                    "source": doc["title"],
+                })
+        rule_engine[category] = category_rules
+        log(f"  Rule engine [{category}]: {len(category_rules)} rules extracted")
+
+    return rule_engine
+
+
+def apply_knowledge_to_trend(h1_result, rule_engine):
+    """将知识库趋势规则应用到1H趋势分析"""
+    trend_rules = rule_engine.get("trend", [])
+    sr_rules = rule_engine.get("support_resistance", [])
+
+    enhancements = []
+
+    # 规则: 市场倾向是交易优势的核心
+    for r in trend_rules:
+        if "市场倾向" in r["rule"] or "交易优势" in r["rule"]:
+            trend_dir = h1_result["trend_dir"]
+            if trend_dir == "UP":
+                enhancements.append(
+                    f"[KB] {r['rule']} -> 当前1H上涨趋势明确，市场倾向做多，具备交易优势"
+                )
+            elif trend_dir == "DOWN":
+                enhancements.append(
+                    f"[KB] {r['rule']} -> 当前1H下跌趋势明确，市场倾向做空，具备交易优势"
+                )
+            else:
+                enhancements.append(
+                    f"[KB] {r['rule']} -> 当前1H震荡，无明确市场倾向，缺乏交易优势"
+                )
+            break
+
+    # 规则: 完整策略=市场倾向+交易设置+退出计划
+    for r in trend_rules:
+        if "完整" in r["rule"] and ("策略" in r["rule"] or "退出" in r["rule"]):
+            enhancements.append(
+                f"[KB] {r['rule']} -> 需确认: 1)市场倾向(趋势) 2)交易设置(回调入场) 3)退出计划(止损/目标)"
+            )
+            break
+
+    # 规则: 支撑阻力相关
+    for r in sr_rules:
+        if "关键" in r["rule"] and ("支撑" in r["rule"] or "阻力" in r["rule"]):
+            enhancements.append(
+                f"[KB] {r['rule']} -> 已识别1H关键支撑{h1_result.get('key_support', [])} "
+                f"阻力{h1_result.get('key_resistance', [])}"
+            )
+            break
+
+    return enhancements
+
+
+def apply_knowledge_to_pullback(m15_result, h1_result, rule_engine):
+    """将知识库回调/信号规则应用到15M回调分析"""
+    pullback_rules = rule_engine.get("pullback", [])
+    signal_rules = rule_engine.get("signal", [])
+    entry_rules = rule_engine.get("entry_exit", [])
+
+    enhancements = []
+    trend_dir = h1_result["trend_dir"]
+
+    # 规则: 回调交易的核心 - 顺趋势方向交易回调
+    for r in pullback_rules:
+        if "回调" in r["rule"] and ("趋势" in r["rule"] or "顺" in r["rule"]):
+            if trend_dir == "UP":
+                enhancements.append(
+                    f"[KB] {r['rule']} -> 1H上涨趋势中，只寻找做多回调入场机会"
+                )
+            elif trend_dir == "DOWN":
+                enhancements.append(
+                    f"[KB] {r['rule']} -> 1H下跌趋势中，只寻找做空回调入场机会"
+                )
+            break
+
+    # 规则: Pin Bar情境交易方法
+    for r in signal_rules:
+        if "pin bar" in r["rule"].lower() or "Pin Bar" in r["rule"]:
+            bull_signals = m15_result.get("bull_signals", [])
+            bear_signals = m15_result.get("bear_signals", [])
+            if trend_dir == "UP" and bull_signals:
+                enhancements.append(
+                    f"[KB] {r['rule']} -> 15M出现看涨Pin Bar，配合上涨趋势回调，信号有效"
+                )
+            elif trend_dir == "DOWN" and bear_signals:
+                enhancements.append(
+                    f"[KB] {r['rule']} -> 15M出现看跌Pin Bar，配合下跌趋势回调，信号有效"
+                )
+            break
+
+    # 规则: 吞没形态
+    for r in signal_rules:
+        if "吞没" in r["rule"] or "engulfing" in r["rule"].lower():
+            bull_signals = m15_result.get("bull_signals", [])
+            bear_signals = m15_result.get("bear_signals", [])
+            has_bull_engulf = any("吞没" in s["type"] and "看涨" in s["type"] for s in bull_signals)
+            has_bear_engulf = any("吞没" in s["type"] and "看跌" in s["type"] for s in bear_signals)
+            if trend_dir == "UP" and has_bull_engulf:
+                enhancements.append(
+                    f"[KB] {r['rule']} -> 15M出现看涨吞没，上涨趋势回调结束信号增强"
+                )
+            elif trend_dir == "DOWN" and has_bear_engulf:
+                enhancements.append(
+                    f"[KB] {r['rule']} -> 15M出现看跌吞没，下跌趋势回调结束信号增强"
+                )
+            break
+
+    # 规则: 入场/止损相关
+    for r in entry_rules:
+        if "止损" in r["rule"] or "stop" in r["rule"].lower():
+            enhancements.append(f"[KB] {r['rule']}")
+            break
+
+    for r in entry_rules:
+        if "入场" in r["rule"] or "entry" in r["rule"].lower():
+            enhancements.append(f"[KB] {r['rule']}")
+            break
+
+    return enhancements
+
+
+# ============================================================
+# 分析工具
+# ============================================================
+
+def find_swings(candles, left=3, right=3):
+    """识别摆动高点和摆动低点"""
+    swing_highs = []
+    swing_lows = []
+    for i in range(left, len(candles) - right):
+        if all(candles[i]['high'] >= candles[i-j]['high'] for j in range(1, left+1)) and \
+           all(candles[i]['high'] >= candles[i+j]['high'] for j in range(1, right+1)):
+            swing_highs.append({'idx': i, 'price': candles[i]['high'], 'dt': candles[i]['dt']})
+        if all(candles[i]['low'] <= candles[i-j]['low'] for j in range(1, left+1)) and \
+           all(candles[i]['low'] <= candles[i+j]['low'] for j in range(1, right+1)):
+            swing_lows.append({'idx': i, 'price': candles[i]['low'], 'dt': candles[i]['dt']})
+    return swing_highs, swing_lows
+
+
+def calc_sma(candles, period):
+    """简单移动平均"""
+    if len(candles) < period:
+        return None
+    return sum(c['close'] for c in candles[-period:]) / period
+
+
+def detect_signals(candles, lookback=30):
+    """检测价格行为信号"""
+    signals = []
+    start = max(1, len(candles) - lookback)
+    for i in range(start, len(candles)):
+        c = candles[i]
+        bar_range = c['high'] - c['low']
+        if bar_range == 0:
+            continue
+        body = abs(c['close'] - c['open'])
+        upper_shadow = c['high'] - max(c['open'], c['close'])
+        lower_shadow = min(c['open'], c['close']) - c['low']
+
+        # Bullish pin bar
+        if lower_shadow > body * 2 and lower_shadow > upper_shadow * 2 and body > 0:
+            signals.append({'dt': c['dt'], 'type': '看涨Pin Bar', 'price': c['close']})
+        # Bearish pin bar
+        if upper_shadow > body * 2 and upper_shadow > lower_shadow * 2 and body > 0:
+            signals.append({'dt': c['dt'], 'type': '看跌Pin Bar', 'price': c['close']})
+
+        # Engulfing
+        prev = candles[i-1]
+        if prev['close'] < prev['open'] and c['close'] > c['open']:
+            if c['open'] <= prev['close'] and c['close'] >= prev['open']:
+                signals.append({'dt': c['dt'], 'type': '看涨吞没', 'price': c['close']})
+        if prev['close'] > prev['open'] and c['close'] < c['open']:
+            if c['open'] >= prev['close'] and c['close'] <= prev['open']:
+                signals.append({'dt': c['dt'], 'type': '看跌吞没', 'price': c['close']})
+
+    return signals
+
+
+# ============================================================
+# 1H 趋势分析
+# ============================================================
+
+def analyze_1h(candles):
+    """1H趋势分析"""
+    result = {}
+    current_price = candles[-1]['close']
+    result['current_price'] = current_price
+    result['latest_time'] = candles[-1]['dt']
+
+    # 摆动结构
+    swing_highs, swing_lows = find_swings(candles)
+
+    # 最近50根摆动分析
+    recent_sh = [sh for sh in swing_highs if sh['idx'] >= len(candles) - 50]
+    recent_sl = [sl for sl in swing_lows if sl['idx'] >= len(candles) - 50]
+
+    hh = sum(1 for i in range(1, len(recent_sh)) if recent_sh[i]['price'] > recent_sh[i-1]['price'])
+    lh = sum(1 for i in range(1, len(recent_sh)) if recent_sh[i]['price'] < recent_sh[i-1]['price'])
+    hl = sum(1 for i in range(1, len(recent_sl)) if recent_sl[i]['price'] > recent_sl[i-1]['price'])
+    ll = sum(1 for i in range(1, len(recent_sl)) if recent_sl[i]['price'] < recent_sl[i-1]['price'])
+
+    result['swing'] = {'HH': hh, 'LH': lh, 'HL': hl, 'LL': ll}
+
+    # 趋势判定
+    if hh > lh and hl > ll:
+        trend = "上涨趋势(HH+HL)"
+        trend_dir = "UP"
+    elif lh > hh and ll > hl:
+        trend = "下跌趋势(LH+LL)"
+        trend_dir = "DOWN"
+    else:
+        trend = "震荡/整理"
+        trend_dir = "RANGE"
+
+    result['trend'] = trend
+    result['trend_dir'] = trend_dir
+
+    # MA
+    sma20 = calc_sma(candles, 20)
+    sma50 = calc_sma(candles, 50)
+    result['sma20'] = sma20
+    result['sma50'] = sma50
+    result['above_sma20'] = current_price > sma20 if sma20 else None
+    result['above_sma50'] = current_price > sma50 if sma50 else None
+    result['ma_bullish'] = sma20 and sma50 and sma20 > sma50
+
+    # 近20根K线多空
+    last20 = candles[-20:]
+    result['bull_count_20'] = sum(1 for c in last20 if c['close'] > c['open'])
+    result['bear_count_20'] = sum(1 for c in last20 if c['close'] < c['open'])
+
+    # 最近摆动点
+    result['last_swing_high'] = swing_highs[-1] if swing_highs else None
+    result['last_swing_low'] = swing_lows[-1] if swing_lows else None
+    result['prev_swing_low'] = swing_lows[-2] if len(swing_lows) >= 2 else None
+
+    # 关键支撑阻力
+    key_resistance = sorted(set(sh['price'] for sh in recent_sh), reverse=True)[:3]
+    key_support = sorted(set(sl['price'] for sl in recent_sl))[:3]
+    result['key_resistance'] = key_resistance
+    result['key_support'] = key_support
+
+    return result
+
+
+# ============================================================
+# 15M 回调分析
+# ============================================================
+
+def analyze_15m(candles, h1_result):
+    """15M回调分析"""
+    result = {}
+    current_price = candles[-1]['close']
+    result['current_price'] = current_price
+    result['latest_time'] = candles[-1]['dt']
+
+    # 摆动结构
+    swing_highs, swing_lows = find_swings(candles)
+    result['last_swing_high'] = swing_highs[-1] if swing_highs else None
+    result['last_swing_low'] = swing_lows[-1] if swing_lows else None
+
+    # 斐波那契回撤 (基于1H主浪)
+    h1_prev_low = h1_result.get('prev_swing_low', {})
+    h1_last_high = h1_result.get('last_swing_high', {})
+
+    if h1_prev_low and h1_last_high:
+        impulse_start = h1_prev_low.get('price', current_price * 0.95)
+        impulse_end = h1_last_high.get('price', current_price * 1.05)
+        impulse_range = impulse_end - impulse_start
+
+        fibs = {
+            '23.6%': impulse_end - impulse_range * 0.236,
+            '38.2%': impulse_end - impulse_range * 0.382,
+            '50.0%': impulse_end - impulse_range * 0.500,
+            '61.8%': impulse_end - impulse_range * 0.618,
+            '78.6%': impulse_end - impulse_range * 0.786,
+        }
+        result['fib'] = fibs
+        result['impulse_start'] = impulse_start
+        result['impulse_end'] = impulse_end
+        result['pullback_pct'] = (impulse_end - current_price) / impulse_range * 100 if impulse_range > 0 else 0
+
+    # 价格行为信号
+    signals = detect_signals(candles, lookback=30)
+    result['signals'] = signals
+    result['bull_signals'] = [s for s in signals if '看涨' in s['type']]
+    result['bear_signals'] = [s for s in signals if '看跌' in s['type']]
+
+    # 趋势柱统计
+    last30 = candles[-30:]
+    bull_trend = 0
+    bear_trend = 0
+    for c in last30:
+        bar_range = c['high'] - c['low']
+        if bar_range == 0:
+            continue
+        body_pct = abs(c['close'] - c['open']) / bar_range
+        if c['close'] > c['open'] and body_pct >= 0.5:
+            bull_trend += 1
+        elif c['close'] < c['open'] and body_pct >= 0.5:
+            bear_trend += 1
+    result['bull_trend_bars'] = bull_trend
+    result['bear_trend_bars'] = bear_trend
+
+    # 成交量
+    avg_vol = sum(c['volume'] for c in candles) / len(candles) if candles else 1
+    recent_avg = sum(c['volume'] for c in candles[-20:]) / 20 if len(candles) >= 20 else avg_vol
+    result['avg_vol'] = avg_vol
+    result['recent_avg_vol'] = recent_avg
+    result['volume_shrinking'] = recent_avg < avg_vol
+
+    # 最近5根K线多空
+    last5 = candles[-5:]
+    result['bear_in_last5'] = sum(1 for c in last5 if c['close'] < c['open'])
+
+    # 最近10根K线详情
+    recent_bars = []
+    for c in candles[-10:]:
+        bar_range = c['high'] - c['low']
+        body_pct = int(abs(c['close'] - c['open']) / bar_range * 100) if bar_range > 0 else 0
+        recent_bars.append({
+            'dt': c['dt'],
+            'open': c['open'],
+            'high': c['high'],
+            'low': c['low'],
+            'close': c['close'],
+            'dir': '看涨' if c['close'] > c['open'] else '看跌',
+            'body_pct': body_pct,
+        })
+    result['recent_bars'] = recent_bars
+
+    # 回调结束评分
+    score = 0
+    conditions = []
+
+    # 条件1: 斐波那契位
+    fib = result.get('fib', {})
+    at_fib = False
+    for name, level in fib.items():
+        if abs(current_price - level) / level * 100 < 1.5:
+            at_fib = True
+            conditions.append(f"[Fib] 在{name}斐波那契位附近({level:.4f})")
+            score += 1
+            break
+    if not at_fib:
+        conditions.append("[Fib] 不在关键斐波那契位附近")
+
+    # 条件2: �
