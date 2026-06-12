@@ -28,6 +28,8 @@ IMA_CLIENT_ID = os.environ.get("IMA_CLIENT_ID", "")
 IMA_API_KEY = os.environ.get("IMA_API_KEY", "")
 IMA_KB_ID = os.environ.get("IMA_KB_ID", "")
 
+CC_API_KEY = "2c49ca804a0b6398206362ac06647a221f7faa107c4f0345f0a2e8ec720b3fe0"
+
 OUTPUT_DIR = os.environ.get("TRACKER_OUTPUT_DIR", os.path.join(os.getcwd(), "output"))
 
 # 知识库搜索关键词（按分析阶段分组）
@@ -79,6 +81,7 @@ def fetch_candles(symbol, interval, limit=200):
             "fsym": symbol.split("-")[0],
             "tsym": symbol.split("-")[1],
             "limit": batch,
+            "api_key": CC_API_KEY,
             **params,
         }
         if ts:
