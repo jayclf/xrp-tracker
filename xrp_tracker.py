@@ -29,7 +29,18 @@ IMA_CLIENT_ID = os.environ.get("IMA_CLIENT_ID", "")
 IMA_API_KEY = os.environ.get("IMA_API_KEY", "")
 IMA_KB_ID = os.environ.get("IMA_KB_ID", "")
 
-CC_API_KEY = "2c49ca804a0b6398206362ac06647a221f7faa107c4f0345f0a2e8ec720b3fe0"
+CC_API_KEY = os.environ.get("CC_API_KEY", "")
+
+# OKX 行情接口（公共接口，无需 Key）
+OKX_BASE_URL = os.environ.get("OKX_BASE_URL", "https://www.okx.com")
+OKX_BAR_MAP = {
+    "1h": "1H",
+    "15m": "15m",
+    "5m": "5m",
+    "30m": "30m",
+    "4h": "4H",
+    "1d": "1D",
+}
 
 # 讯飞星火 Coding Plan 配置（PDF识图兜底）
 XF_SPARK_BASE_URL = os.environ.get("XF_SPARK_BASE_URL", "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2")
@@ -65,83 +76,75 @@ def log(msg):
 
 
 # ============================================================
-# CryptoCompare 数据获取
+# OKX 行情数据获取
 # ============================================================
 
 def fetch_candles(symbol, interval, limit=200):
-    """从CryptoCompare获取K线数据"""
-    if interval == "1h":
-        endpoint = "histohour"
-        params = {"aggregate": 1}
-    elif interval == "15m":
-        endpoint = "histominute"
-        params = {"aggregate": 15}
-    else:
+    """从OKX获取K线数据（公共接口，无需认证）
+
+    Args:
+        symbol: 如 "XRP-USDT"
+        interval: "1h" / "15m"
+        limit: 最多300根（OKX单次上限）
+
+    Returns:
+        list[list]: OKX 原始K线格式 [[ts, o, h, l, c, vol, volCcy], ...]
+    """
+    bar = OKX_BAR_MAP.get(interval)
+    if not bar:
+        log(f"  ❌ 不支持的K线周期: {interval}")
         return []
 
-    all_candles = []
-    remaining = limit
-    ts = None
+    inst_id = symbol
+    url = f"{OKX_BASE_URL}/api/v5/market/candles"
+    params = {
+        "instId": inst_id,
+        "bar": bar,
+        "limit": str(min(limit, 300)),
+    }
+    query = urllib.parse.urlencode(params)
+    full_url = f"{url}?{query}"
 
-    while remaining > 0:
-        batch = min(remaining, 2000)
-        p = {
-            "fsym": symbol.split("-")[0],
-            "tsym": symbol.split("-")[1],
-            "limit": batch,
-            "api_key": CC_API_KEY,
-            **params,
-        }
-        if ts:
-            p["toTs"] = ts
+    try:
+        req = urllib.request.Request(full_url, headers={"User-Agent": "XRPTracker/2.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log(f"  OKX request failed: {e}")
+        return []
 
-        url = f"https://min-api.cryptocompare.com/data/{endpoint}?{urllib.parse.urlencode(p)}"
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "XRPTracker/2.0"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except Exception as e:
-            log(f"  CryptoCompare request failed: {e}")
-            break
+    if data.get("code") != "0":
+        log(f"  OKX API error: code={data.get('code')} msg={data.get('msg')}")
+        return []
 
-        candles = data.get("Data", [])
-        if not candles:
-            break
+    candles = data.get("data", [])
+    if not candles:
+        log("  OKX returned empty data")
+        return []
 
-        all_candles.extend(candles)
-        remaining -= len(candles)
-
-        if len(candles) < batch:
-            break
-
-        oldest_ts = min(c["time"] for c in candles)
-        ts = oldest_ts - 1
-
-    # 去重 + 排序 + 取最新limit根
-    seen = set()
-    unique = []
-    for c in reversed(all_candles):
-        t = c["time"]
-        if t not in seen:
-            seen.add(t)
-            unique.append(c)
-    unique.reverse()
-
-    return unique[-limit:] if len(unique) > limit else unique
+    # OKX返回的K线是从最新往后排，反转成从旧到新
+    candles.reverse()
+    return candles
 
 
 def parse_candles(raw):
-    """解析K线数据为标准格式"""
+    """解析OKX K线数据为标准格式
+
+    OKX原始格式: [ts_ms, o, h, l, c, vol, volCcy, confirm]
+    输出格式: {time, dt, open, high, low, close, volume}
+    """
     result = []
     for c in raw:
+        ts_ms = int(c[0])
+        ts_sec = ts_ms // 1000
         result.append({
-            "time": c["time"],
-            "dt": datetime.fromtimestamp(c["time"], tz=timezone.utc).strftime("%m-%d %H:%M"),
-            "open": float(c["open"]),
-            "high": float(c["high"]),
-            "low": float(c["low"]),
-            "close": float(c["close"]),
-            "volume": float(c.get("volumeto", c.get("volume", 0))),
+            "time": ts_sec,
+            "dt": datetime.fromtimestamp(ts_sec, tz=timezone.utc).strftime("%m-%d %H:%M"),
+            "open": float(c[1]),
+            "high": float(c[2]),
+            "low": float(c[3]),
+            "close": float(c[4]),
+            "volume": float(c[5]),
         })
     return result
 
