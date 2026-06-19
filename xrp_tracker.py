@@ -185,7 +185,7 @@ def search_knowledge(query, top_k=5):
     if not data:
         return []
     results = []
-    items = data if isinstance(data, list) else data.get("list", data.get("results", []))
+    items = data if isinstance(data, list) else data.get("info_list", data.get("list", data.get("results", [])))
     for item in items:
         media_id = item.get("media_id", "")
         title = item.get("title", item.get("name", ""))
