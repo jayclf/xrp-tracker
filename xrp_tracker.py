@@ -27,7 +27,16 @@ SC_SENDKEY = os.environ.get("SC_SENDKEY", "")
 
 IMA_CLIENT_ID = os.environ.get("IMA_CLIENT_ID", "")
 IMA_API_KEY = os.environ.get("IMA_API_KEY", "")
-IMA_KB_ID = os.environ.get("IMA_KB_ID", "")
+IMA_KB_ID = os.environ.get("IMA_KB_ID", "OaY9MZEm7Mp4evh57u9yOZt3AmbdjChC35YQDSgaZtY=")
+
+# 全部知识库ID列表（用于多库搜索）
+ALL_KB_IDS = [
+    IMA_KB_ID,  # Space的知识库（个人）
+    "zHUwiT01C42Mb_5a5BTTXLLoR-s1br-9I5Rf0tguUWQ=",  # 价格行为｜AI智能体
+    "CBcW9MD48OUzXQY13sJI1vWUEgi4PHoHIciogVeb4yA=",  # 价格行为学（1822人）
+    "u3YfPPZntBPZfyEzRY5gqDBOh1XbrX9qVKpQFe482yY=",  # 价格行为学（1010人）
+    "zZFfYk0ZjI9VoD40h2Lrorqay5Gl9qVFFd113ADJO78=",  # Al Brooks 价格行为学
+]
 
 CC_API_KEY = os.environ.get("CC_API_KEY", "")
 
@@ -175,10 +184,13 @@ def ima_request(endpoint, body):
         return None
 
 
-def search_knowledge(query, top_k=5):
-    """搜索知识库"""
+def search_knowledge(query, top_k=5, kb_id=None):
+    """搜索知识库（支持指定 kb_id，默认用 IMA_KB_ID）"""
+    kid = kb_id or IMA_KB_ID
+    if not kid:
+        return []
     data = ima_request("search_knowledge", {
-        "knowledge_base_id": IMA_KB_ID,
+        "knowledge_base_id": kid,
         "query": query,
         "top_k": top_k,
     })
@@ -194,20 +206,25 @@ def search_knowledge(query, top_k=5):
     return results
 
 
-def download_pdf_text(media_id):
+def download_pdf_text(media_id, kb_id=None):
     """下载PDF并解析：逐页双通道（PyPDF2文字 + 星火识图补充视觉内容）
 
     流程：
     1. 每页先用 PyPDF2 提取文字（免费）
     2. 每页再转成图片调用星火 Coding Plan 识图（补充图表/表格等视觉内容）
     3. 合并两路结果返回
+
+    Args:
+        media_id: 媒体ID
+        kb_id: 所属知识库ID，默认用 IMA_KB_ID
     """
-    if not IMA_CLIENT_ID or not IMA_API_KEY or not IMA_KB_ID:
+    kid = kb_id or IMA_KB_ID
+    if not IMA_CLIENT_ID or not IMA_API_KEY or not kid:
         return ""
 
     data = ima_request("get_media_info", {
         "media_id": media_id,
-        "knowledge_base_id": IMA_KB_ID,
+        "knowledge_base_id": kid,
     })
     if not data:
         return ""
@@ -357,50 +374,64 @@ def spark_ocr_pdf(pdf_data, text_by_page=None):
 
 def fetch_knowledge_rules():
     """
-    从知识库搜索并提取交易规则文本
-    返回: dict[category] -> list[dict(title, text)]
-    每个类别独立计数下载PDF数量（修复原版全局计数Bug）
+    从全部知识库搜索并提取交易规则文本
+    返回: dict[category] -> list[dict(title, text, source_kb)]
+    遍历 ALL_KB_IDS，去重 media_id，每个类别独立计数
     """
     knowledge = {}
     seen_media_ids = set()
 
     log("\n--- Knowledge Base Rule Fetching ---")
 
-    if not IMA_CLIENT_ID or not IMA_API_KEY or not IMA_KB_ID:
+    if not IMA_CLIENT_ID or not IMA_API_KEY:
         log("  ima API credentials not configured, skip knowledge base")
         return knowledge
 
-    for category, queries in KB_SEARCH_QUERIES.items():
-        category_docs = []
-        category_downloaded = 0  # 每个类别独立计数
+    if not ALL_KB_IDS:
+        log("  No knowledge base IDs configured, skip")
+        return knowledge
 
-        for query in queries:
-            if category_downloaded >= MAX_PDF_PER_CATEGORY:
-                break
+    log(f"  Searching {len(ALL_KB_IDS)} knowledge bases...")
 
-            results = search_knowledge(query, top_k=3)
-            for item in results:
-                mid = item["media_id"]
-                if mid in seen_media_ids:
-                    continue
-                seen_media_ids.add(mid)
+    for kb_id in ALL_KB_IDS:
+        if not kb_id:
+            continue
 
-                if category_downloaded >= MAX_PDF_PER_CATEGORY:
+        for category, queries in KB_SEARCH_QUERIES.items():
+            # 如果该分类已有足够文档，跳过
+            existing = len(knowledge.get(category, []))
+            if existing >= MAX_PDF_PER_CATEGORY:
+                continue
+
+            category_needed = MAX_PDF_PER_CATEGORY - existing
+
+            for query in queries:
+                if category_needed <= 0:
                     break
 
-                log(f"  [{category}] Downloading: {item['title'][:50]}...")
-                text = download_pdf_text(mid)
-                if text:
-                    category_docs.append({
-                        "title": item["title"],
-                        "text": text[:MAX_CHARS_PER_PDF],
-                        "total_chars": len(text),
-                    })
-                    category_downloaded += 1
-                    log(f"    Got {len(text)} chars (using first {MAX_CHARS_PER_PDF})")
+                results = search_knowledge(query, top_k=3, kb_id=kb_id)
+                for item in results:
+                    mid = item["media_id"]
+                    if mid in seen_media_ids:
+                        continue
+                    seen_media_ids.add(mid)
 
-        if category_docs:
-            knowledge[category] = category_docs
+                    if category_needed <= 0:
+                        break
+
+                    log(f"  [{category}] Downloading: {item['title'][:50]}...")
+                    text = download_pdf_text(mid, kb_id=kb_id)
+                    if text:
+                        if category not in knowledge:
+                            knowledge[category] = []
+                        knowledge[category].append({
+                            "title": item["title"],
+                            "text": text[:MAX_CHARS_PER_PDF],
+                            "total_chars": len(text),
+                            "source_kb": kb_id,
+                        })
+                        category_needed -= 1
+                        log(f"    Got {len(text)} chars (using first {MAX_CHARS_PER_PDF})")
 
     total_docs = sum(len(docs) for docs in knowledge.values())
     total_chars = sum(sum(d["total_chars"] for d in docs) for docs in knowledge.values())
