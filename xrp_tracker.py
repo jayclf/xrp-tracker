@@ -16,6 +16,7 @@ import os
 import re
 import io
 import hashlib
+import base64
 from datetime import datetime, timezone
 
 # ============================================================
@@ -29,6 +30,13 @@ IMA_API_KEY = os.environ.get("IMA_API_KEY", "")
 IMA_KB_ID = os.environ.get("IMA_KB_ID", "")
 
 CC_API_KEY = "2c49ca804a0b6398206362ac06647a221f7faa107c4f0345f0a2e8ec720b3fe0"
+
+# 讯飞星火 Coding Plan 配置（PDF识图兜底）
+XF_SPARK_BASE_URL = os.environ.get("XF_SPARK_BASE_URL", "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2")
+XF_SPARK_API_KEY = os.environ.get("XF_SPARK_API_KEY", "")
+XF_SPARK_MODEL = os.environ.get("XF_SPARK_MODEL", "astron-code-latest")
+XF_SPARK_ENABLED = os.environ.get("XF_SPARK_ENABLED", "1") == "1"
+XF_SPARK_MAX_PAGES = int(os.environ.get("XF_SPARK_MAX_PAGES", "5"))  # 每次最多处理5页，省额度
 
 OUTPUT_DIR = os.environ.get("TRACKER_OUTPUT_DIR", os.path.join(os.getcwd(), "output"))
 
@@ -217,13 +225,98 @@ def download_pdf_text(media_id):
         for page in reader.pages:
             page_text = page.extract_text() or ""
             text += page_text + "\n"
+
+        # PyPDF2 提取成功但文字太少 → 可能是图片版PDF，走星火兜底
+        if text.strip() and len(text.strip()) < 50 and XF_SPARK_ENABLED:
+            log(f"  PyPDF2 only extracted {len(text.strip())} chars (likely image-based PDF), fallback to XF Spark OCR...")
+            return spark_ocr_pdf(pdf_data)
+
         return text
     except ImportError:
-        log("  PyPDF2 not installed, skip PDF parsing")
-        return ""
+        log("  PyPDF2 not installed")
+        # PyPDF2 不可用，直接走星火兜底
+        return spark_ocr_pdf(pdf_data) if XF_SPARK_ENABLED else ""
     except Exception as e:
         log(f"  PDF parse failed: {e}")
+        # PyPDF2 解析失败，走星火兜底
+        return spark_ocr_pdf(pdf_data) if XF_SPARK_ENABLED else ""
+
+
+def spark_ocr_pdf(pdf_data):
+    """用星火 Coding Plan 识图能力提取PDF内容（兜底方案）
+
+    当 PyPDF2 提取文本太少或失败时，把PDF页渲染成图片，
+    调用星火 Coding Plan 的图片理解能力进行OCR识别。
+
+    设计原则：省额度——最多处理前 N 页，且只在 PyPDF2 不够用时触发。
+    """
+    if not XF_SPARK_ENABLED:
+        log("  XF Spark OCR disabled via env var, skip")
         return ""
+
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        log("  PyMuPDF (fitz) not installed, cannot do Spark OCR")
+        return ""
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        log("  openai package not installed, cannot do Spark OCR")
+        return ""
+
+    doc = fitz.open(stream=pdf_data, filetype="pdf")
+    total_pages = len(doc)
+    pages_to_process = min(total_pages, XF_SPARK_MAX_PAGES)
+    log(f"  [XF Spark] PDF has {total_pages} pages, processing first {pages_to_process} pages...")
+
+    client = OpenAI(
+        base_url=XF_SPARK_BASE_URL,
+        api_key=XF_SPARK_API_KEY,
+    )
+
+    all_text_parts = []
+
+    for page_num in range(pages_to_process):
+        page = doc[page_num]
+        pix = page.get_pixmap(dpi=200)  # 200dpi，文字清晰度够用
+        img_bytes = pix.tobytes("png")
+        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+        img_size_kb = len(img_b64) // 1024
+
+        log(f"  [XF Spark] OCR page {page_num + 1}/{total_pages} ({img_size_kb}KB)...")
+
+        try:
+            resp = client.chat.completions.create(
+                model=XF_SPARK_MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "把这张图片里的所有文字原样提取出来，包括标题、列表、编号。只输出提取到的文字，不要额外解释。",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+                        },
+                    ],
+                }],
+                max_tokens=1000,
+                temperature=0.1,
+            )
+            page_text = resp.choices[0].message.content.strip()
+            all_text_parts.append(f"--- Page {page_num + 1} ---\n{page_text}")
+            log(f"    Got {len(page_text)} chars")
+        except Exception as e:
+            log(f"  [XF Spark] Page {page_num + 1} failed: {e}")
+            all_text_parts.append(f"--- Page {page_num + 1} ---\n[OCR failed]")
+
+    doc.close()
+    result = "\n\n".join(all_text_parts)
+    log(f"  [XF Spark] OCR complete: {len(result)} chars from {pages_to_process} pages")
+    return result
 
 
 def fetch_knowledge_rules():

@@ -44,6 +44,9 @@ jobs:
           IMA_CLIENT_ID: ${{ secrets.IMA_CLIENT_ID }}
           IMA_API_KEY: ${{ secrets.IMA_API_KEY }}
           IMA_KB_ID: ${{ secrets.IMA_KB_ID }}
+          XF_SPARK_API_KEY: ${{ secrets.XF_SPARK_API_KEY }}
+          XF_SPARK_ENABLED: "1"
+          XF_SPARK_MAX_PAGES: "5"
           TRACKER_OUTPUT_DIR: output
         run: python xrp_tracker.py
 
