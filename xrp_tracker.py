@@ -42,11 +42,11 @@ OUTPUT_DIR = os.environ.get("TRACKER_OUTPUT_DIR", os.path.join(os.getcwd(), "out
 
 # 知识库搜索关键词（按分析阶段分组）
 KB_SEARCH_QUERIES = {
-    "trend": ["趋势", "trend", "market structure", "swing"],
-    "pullback": ["回调", "pullback", "retracement"],
-    "signal": ["pin bar", "吞没", "engulfing", "price action pattern"],
-    "support_resistance": ["支撑阻力", "support resistance"],
-    "entry_exit": ["入场", "止损", "entry", "stop loss", "profit target"],
+    "trend": ["趋势", "趋势线", "market structure", "swing", "摆动"],
+    "pullback": ["回调", "pullback", "retracement", "回撤"],
+    "signal": ["pin bar", "吞没", "engulfing", "K线形态", "蜡烛图", "price action pattern"],
+    "support_resistance": ["支撑阻力", "support resistance", "供需"],
+    "entry_exit": ["入场", "止损", "entry", "stop loss", "风险管理", "仓位管理"],
 }
 
 MAX_PDF_PER_CATEGORY = 3
