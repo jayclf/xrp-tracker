@@ -1006,108 +1006,112 @@ def format_report(h1, m15, plan):
 
 
 # ============================================================
-# ServerChan推送 (urllib直连，无需serverchan-sdk)
+# ServerChan推送 (手机优化版)
 # ============================================================
 
 def push_notification(h1, m15, plan):
-    """通过ServerChan推送分析结果"""
+    """通过ServerChan推送分析结果（手机WeChat优化版）"""
     if not SC_SENDKEY:
         log("  ⚠️ SC_SENDKEY未配置，跳过推送")
         return None
 
-    now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    now = datetime.now(timezone.utc).strftime('%H:%M UTC')
+    trend_dir = h1.get('trend_dir', '')
+    score = m15.get('pullback_score', 0)
+    verdict = m15.get('pullback_verdict', '')
 
-    # 构建标题
-    title = "定时分析总结"
+    # ——— 动态标题 ———
+    dir_icon = "📈" if trend_dir == "UP" else "📉" if trend_dir == "DOWN" else "📊"
+    score_icon = " ✅" if score >= 4 else " ⚠️" if score >= 2 else " ❌"
+    title = f"{dir_icon} XRP {h1.get('trend', '')} 回调评分{score}/5{score_icon}"
 
-    # 构建Markdown内容
     lines = []
-    lines.append(f"## XRP-USDT 定时分析")
-    lines.append(f"**时间**: {now}")
-    lines.append("")
+    sep = "━━━━━━━━━━━━━━━━━━"
 
-    # 1H趋势
-    lines.append("### 1H 趋势")
-    lines.append(f"- **趋势**: {h1.get('trend', '')}")
-    lines.append(f"- **当前价**: {h1['current_price']:.4f}")
-    lines.append(f"- **摆动结构**: HH={h1['swing']['HH']} LH={h1['swing']['LH']} HL={h1['swing']['HL']} LL={h1['swing']['LL']}")
-    lines.append(f"- **SMA20**: {h1['sma20']:.4f} ({'上方' if h1['above_sma20'] else '下方'})")
-    lines.append(f"- **SMA50**: {h1['sma50']:.4f} ({'上方' if h1['above_sma50'] else '下方'})")
-    lines.append(f"- **MA排列**: {'多头' if h1['ma_bullish'] else '空头'}")
-    lines.append(f"- **近20根**: 看涨{h1['bull_count_20']} 看跌{h1['bear_count_20']}")
+    # ——— 顶部快速摘要 ———
+    lines.append(sep)
 
-    if h1.get('last_swing_high'):
-        ls = h1['last_swing_high']
-        lines.append(f"- **最近摆动高点**: {ls['price']:.4f} ({ls['dt'][:16]})")
-    if h1.get('last_swing_low'):
-        ls = h1['last_swing_low']
-        lines.append(f"- **最近摆动低点**: {ls['price']:.4f} ({ls['dt'][:16]})")
+    # 趋势行
+    trend_line = f"{dir_icon} 趋势：1H {h1.get('trend', '')}"
+    if h1.get('ma_bullish') is not None:
+        trend_line += f"，MA{'多头' if h1['ma_bullish'] else '空头'}排列"
+    trend_line += f"，现价{h1['current_price']:.4f}"
+    lines.append(trend_line)
 
-    lines.append(f"- **阻力**: {', '.join(f'{r:.4f}' for r in h1.get('key_resistance', []))}")
-    lines.append(f"- **支撑**: {', '.join(f'{s:.4f}' for s in h1.get('key_support', []))}")
-    lines.append("")
-
-    # 15M回调
-    lines.append("### 15M 回调分析")
-    lines.append(f"- **当前价**: {m15['current_price']:.4f}")
+    # 回调行
+    pullback_info = f"📉 回调：15M"
     if 'pullback_pct' in m15:
-        lines.append(f"- **回调深度**: {m15['pullback_pct']:.1f}%")
-    lines.append(f"- **趋势柱(近30根)**: 看涨{m15['bull_trend_bars']} 看跌{m15['bear_trend_bars']}")
-    lines.append(f"- **量能**: {'缩量 ✅' if m15.get('volume_shrinking') else '放量 ⚠️'} (近期均量{m15.get('recent_avg_vol', 0):.0f})")
-    lines.append(f"- **看涨信号**: {len(m15.get('bull_signals', []))}个 | **看跌信号**: {len(m15.get('bear_signals', []))}个")
+        pullback_info += f" 回撤{m15['pullback_pct']:.1f}%"
+    bull_signals = m15.get('bull_signals', [])
+    bear_signals = m15.get('bear_signals', [])
+    if trend_dir == "UP" and bull_signals:
+        pullback_info += f"，出现看涨信号({len(bull_signals)}个)"
+    elif trend_dir == "DOWN" and bear_signals:
+        pullback_info += f"，出现看跌信号({len(bear_signals)}个)"
+    else:
+        pullback_info += f"，无明确PA信号"
+    lines.append(pullback_info)
+
+    # 评分行（5分 bar）
+    score_bar = "●" * score + "○" * (5 - score)
+    vol_icon = "✅" if m15.get('volume_shrinking') else "⚠️"
+    vol_text = "缩量" if m15.get('volume_shrinking') else "放量"
+    lines.append(f"🎯 评分：{score}/5 {score_bar} | 量能：{vol_icon}{vol_text}")
+
+    # 趋势柱统计
+    bull_bars = m15.get('bull_trend_bars', 0)
+    bear_bars = m15.get('bear_trend_bars', 0)
+    lines.append(f"📊 近30根：🟢{bull_bars} 🔴{bear_bars}")
+
+    lines.append(f"💡 结论：{verdict}")
     lines.append("")
 
-    # 斐波那契
-    if 'fib' in m15:
-        lines.append("#### 斐波那契回撤")
-        for name, level in m15['fib'].items():
-            marker = " ◀️" if abs(m15['current_price'] - level) / level * 100 < 1.5 else ""
-            lines.append(f"- {name}: {level:.4f}{marker}")
+    # ——— 交易计划 ———
+    lines.append("📋 交易计划")
+    dir_emoji = "🟢" if plan.get('direction') == "做多" else "🔴" if plan.get('direction') == "做空" else "⚪"
+    lines.append(f"方向：{plan.get('direction', 'N/A')} {dir_emoji}")
+    if plan.get('entry_zone'):
+        lines.append(f"入场：{plan['entry_zone']}")
+    if plan.get('stop_loss'):
+        lines.append(f"止损：{plan['stop_loss']}")
+    tps = []
+    if plan.get('tp1'):
+        tps.append(f"目标1：{plan['tp1']}")
+    if plan.get('tp2'):
+        tps.append(f"目标2：{plan['tp2']}")
+    if tps:
+        lines.append(" | ".join(tps))
+    if plan.get('entry_condition'):
+        lines.append(f"条件：{plan['entry_condition']}")
+    if plan.get('invalidation'):
+        lines.append(f"失效：{plan['invalidation']}")
+    lines.append("")
+
+    # ——— 知识库增强（如果有） ———
+    kb_parts = []
+    kb_trend = h1.get('kb_enhance_trend', [])
+    kb_pullback = m15.get('kb_enhance_pullback', [])
+    for item in kb_trend + kb_pullback:
+        if isinstance(item, str) and item.startswith("[KB]"):
+            kb_parts.append(item)
+    if kb_parts:
+        lines.append("📚 知识库规则")
+        for item in kb_parts[:4]:  # 最多4条，省空间
+            lines.append(f"• {item}")
         lines.append("")
 
-    # 回调评分
-    score = m15.get('pullback_score', 0)
-    score_bar = "●" * score + "○" * (5 - score)
-    lines.append(f"### 回调结束评分: {score_bar} ({score}/5)")
-    for cond in m15.get('pullback_conditions', []):
-        lines.append(f"- {cond}")
-    lines.append(f"\n**➡️ {m15.get('pullback_verdict', '')}**")
-    lines.append("")
-
-    # 最近K线
-    lines.append("### 最近10根15M K线")
-    lines.append("| 时间 | O | H | L | C | 方向 | 实体 |")
-    lines.append("|------|---|---|---|---|------|------|")
-    for bar in m15.get('recent_bars', []):
-        dir_emoji = "🟢" if bar['dir'] == '看涨' else "🔴"
-        lines.append(f"| {bar['dt'][5:16]} | {bar['open']:.4f} | {bar['high']:.4f} | {bar['low']:.4f} | {bar['close']:.4f} | {dir_emoji}{bar['dir']} | {bar['body_pct']}% |")
-    lines.append("")
-
-    # 交易计划
-    lines.append("### 📋 交易计划")
-    lines.append(f"- **方向**: {plan.get('direction', 'N/A')}")
-    if plan.get('entry_zone'):
-        lines.append(f"- **入场区**: {plan['entry_zone']}")
-    if plan.get('stop_loss'):
-        lines.append(f"- **止损**: {plan['stop_loss']}")
-    if plan.get('tp1'):
-        lines.append(f"- **目标1**: {plan['tp1']}")
-    if plan.get('tp2'):
-        lines.append(f"- **目标2**: {plan['tp2']}")
-    if plan.get('entry_condition'):
-        lines.append(f"- **入场条件**: {plan['entry_condition']}")
-    if plan.get('invalidation'):
-        lines.append(f"- **计划失效**: {plan['invalidation']}")
-    lines.append(f"- **回调评分**: {plan.get('pullback_score', 'N/A')}")
-    lines.append("")
-
-    # 变化检测
+    # ——— 变化检测 ———
     changes = detect_changes(h1, m15, plan)
     if changes:
-        lines.append("### ⚡ 信号变化")
-        for change in changes:
-            lines.append(f"- {change}")
+        lines.append("⚡ 变化")
+        for change in changes[:3]:  # 最多3条
+            lines.append(f"• {change}")
         lines.append("")
+
+    # ——— 尾部 ———
+    lines.append("⚠️ 10x杠杆，严格风控")
+    lines.append(sep)
+    lines.append(f"🕐 {now} | 知识库识图增强")
 
     desp = "\n".join(lines)
 
@@ -1222,13 +1226,13 @@ def main():
     log("📊 执行1H趋势分析...")
     h1_result = analyze_1h(h1_candles)
     if rule_engine:
-        h1_result = apply_knowledge_to_trend(h1_result, rule_engine)
+        h1_result['kb_enhance_trend'] = apply_knowledge_to_trend(h1_result, rule_engine)
     log(f"  趋势: {h1_result.get('trend', '')} | 方向: {h1_result.get('trend_dir', '')}")
 
     log("📊 执行15M回调分析...")
     m15_result = analyze_15m(m15_candles, h1_result)
     if rule_engine:
-        m15_result = apply_knowledge_to_pullback(m15_result, h1_result, rule_engine)
+        m15_result['kb_enhance_pullback'] = apply_knowledge_to_pullback(m15_result, h1_result, rule_engine)
     log(f"  回调评分: {m15_result.get('pullback_score', 0)}/5 → {m15_result.get('pullback_verdict', '')}")
 
     # 4. 交易计划
