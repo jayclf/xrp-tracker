@@ -192,7 +192,13 @@ def search_knowledge(query, top_k=5):
 
 
 def download_pdf_text(media_id):
-    """下载PDF并解析: get_media_info -> download -> PyPDF2"""
+    """下载PDF并解析：逐页双通道（PyPDF2文字 + 星火识图补充视觉内容）
+
+    流程：
+    1. 每页先用 PyPDF2 提取文字（免费）
+    2. 每页再转成图片调用星火 Coding Plan 识图（补充图表/表格等视觉内容）
+    3. 合并两路结果返回
+    """
     if not IMA_CLIENT_ID or not IMA_API_KEY or not IMA_KB_ID:
         return ""
 
@@ -218,44 +224,43 @@ def download_pdf_text(media_id):
         log(f"  PDF download failed: {e}")
         return ""
 
+    # ——— PyPDF2：逐页提取文字 ———
+    text_by_page = {}
     try:
         import PyPDF2
         reader = PyPDF2.PdfReader(io.BytesIO(pdf_data))
-        text = ""
-        for page in reader.pages:
+        for i, page in enumerate(reader.pages):
             page_text = page.extract_text() or ""
-            text += page_text + "\n"
-
-        # PyPDF2 提取成功但文字太少 → 可能是图片版PDF，走星火兜底
-        if text.strip() and len(text.strip()) < 50 and XF_SPARK_ENABLED:
-            log(f"  PyPDF2 only extracted {len(text.strip())} chars (likely image-based PDF), fallback to XF Spark OCR...")
-            return spark_ocr_pdf(pdf_data)
-
-        return text
+            text_by_page[i] = page_text.strip()
     except ImportError:
-        log("  PyPDF2 not installed")
-        # PyPDF2 不可用，直接走星火兜底
-        return spark_ocr_pdf(pdf_data) if XF_SPARK_ENABLED else ""
+        log("  PyPDF2 not installed, will rely solely on Spark OCR")
     except Exception as e:
-        log(f"  PDF parse failed: {e}")
-        # PyPDF2 解析失败，走星火兜底
-        return spark_ocr_pdf(pdf_data) if XF_SPARK_ENABLED else ""
+        log(f"  PyPDF2 parse failed ({e}), will rely solely on Spark OCR")
+
+    # ——— 星火识图：逐页补充视觉内容 ———
+    if XF_SPARK_ENABLED:
+        return spark_ocr_pdf(pdf_data, text_by_page)
+    else:
+        # 星火禁用时，直接返回 PyPDF2 的文字
+        text = "\n".join(t for t in text_by_page.values() if t)
+        return text if text else ""
 
 
-def spark_ocr_pdf(pdf_data):
-    """用星火 Coding Plan 识图能力提取PDF内容（兜底方案）
+def spark_ocr_pdf(pdf_data, text_by_page=None):
+    """逐页双通道：PyPDF2文字 + 星火识图补充视觉元素
 
-    当 PyPDF2 提取文本太少或失败时，把PDF页渲染成图片，
-    调用星火 Coding Plan 的图片理解能力进行OCR识别。
+    每一页都调星火识别图片，把图表、K线图、表格等视觉内容
+    补充到 PyPDF2 已提取的文字中。
 
-    设计原则：省额度——最多处理前 N 页，且只在 PyPDF2 不够用时触发。
+    Args:
+        pdf_data: PDF 二进制数据
+        text_by_page: dict[int, str]，PyPDF2 提取的逐页文字
     """
     if not XF_SPARK_ENABLED:
-        log("  XF Spark OCR disabled via env var, skip")
         return ""
 
     try:
-        import fitz  # PyMuPDF
+        import fitz
     except ImportError:
         log("  PyMuPDF (fitz) not installed, cannot do Spark OCR")
         return ""
@@ -265,6 +270,9 @@ def spark_ocr_pdf(pdf_data):
     except ImportError:
         log("  openai package not installed, cannot do Spark OCR")
         return ""
+
+    if text_by_page is None:
+        text_by_page = {}
 
     doc = fitz.open(stream=pdf_data, filetype="pdf")
     total_pages = len(doc)
@@ -276,16 +284,31 @@ def spark_ocr_pdf(pdf_data):
         api_key=XF_SPARK_API_KEY,
     )
 
-    all_text_parts = []
+    merged_pages = []
 
     for page_num in range(pages_to_process):
         page = doc[page_num]
-        pix = page.get_pixmap(dpi=200)  # 200dpi，文字清晰度够用
+
+        # ——— 通道A：PyPDF2 该页文字 ———
+        page_text = text_by_page.get(page_num, "")
+
+        # ——— 通道B：PyMuPDF 渲染图片 ———
+        pix = page.get_pixmap(dpi=200)
         img_bytes = pix.tobytes("png")
         img_b64 = base64.b64encode(img_bytes).decode("utf-8")
         img_size_kb = len(img_b64) // 1024
 
-        log(f"  [XF Spark] OCR page {page_num + 1}/{total_pages} ({img_size_kb}KB)...")
+        log(f"  [XF Spark] Page {page_num + 1}/{total_pages} ({img_size_kb}KB, PyPDF2={len(page_text)} chars)...")
+
+        # ——— 构造提示词：有文字就补充视觉，没文字就全量OCR ———
+        if page_text:
+            prompt = (
+                f"这页PDF的部分文字已提取如下：\n---\n{page_text[:800]}\n---\n"
+                f"请识别图片中是否有K线图、图表、表格、标注、箭头标记等视觉元素，"
+                f"补充其内容和含义。如果图片中没有额外的视觉信息，回复'无视觉内容'即可。"
+            )
+        else:
+            prompt = "把这张图片里的所有文字原样提取出来，包括标题、列表、编号。只输出提取到的文字，不要额外解释。"
 
         try:
             resp = client.chat.completions.create(
@@ -293,29 +316,39 @@ def spark_ocr_pdf(pdf_data):
                 messages=[{
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": "把这张图片里的所有文字原样提取出来，包括标题、列表、编号。只输出提取到的文字，不要额外解释。",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{img_b64}"},
-                        },
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
                     ],
                 }],
                 max_tokens=1000,
                 temperature=0.1,
             )
-            page_text = resp.choices[0].message.content.strip()
-            all_text_parts.append(f"--- Page {page_num + 1} ---\n{page_text}")
-            log(f"    Got {len(page_text)} chars")
+            spark_result = resp.choices[0].message.content.strip()
+            log(f"    Spark补充: {len(spark_result)} chars")
+
+            # ——— 合并该页两个通道的结果 ———
+            if page_text and spark_result and spark_result != "无视觉内容":
+                merged_pages.append(
+                    f"--- Page {page_num + 1} ---\n"
+                    f"[文字部分]\n{page_text}\n"
+                    f"[图片视觉内容]\n{spark_result}"
+                )
+            elif page_text:
+                merged_pages.append(f"--- Page {page_num + 1} ---\n{page_text}")
+            else:
+                merged_pages.append(f"--- Page {page_num + 1} ---\n{spark_result}")
+
         except Exception as e:
             log(f"  [XF Spark] Page {page_num + 1} failed: {e}")
-            all_text_parts.append(f"--- Page {page_num + 1} ---\n[OCR failed]")
+            # 失败时回退：至少有 PyPDF2 的文字
+            if page_text:
+                merged_pages.append(f"--- Page {page_num + 1} ---\n{page_text}")
+            else:
+                merged_pages.append(f"--- Page {page_num + 1} ---\n[OCR failed]")
 
     doc.close()
-    result = "\n\n".join(all_text_parts)
-    log(f"  [XF Spark] OCR complete: {len(result)} chars from {pages_to_process} pages")
+    result = "\n\n".join(merged_pages)
+    log(f"  [XF Spark] Complete: {len(result)} chars from {pages_to_process} pages")
     return result
 
 
