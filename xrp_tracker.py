@@ -618,6 +618,334 @@ def apply_knowledge_to_pullback(m15_result, h1_result, rule_engine):
 
 
 # ============================================================
+# 价格行为趋势规则引擎（知识库规则 → 可执行检查）
+# ============================================================
+
+# 内置价格行为趋势规则
+# 每条规则是一个 dict，包含检查函数和映射知识库关键词的模式
+PA_TREND_RULES = [
+    {
+        "id": "swing_structure",
+        "name": "摆动结构：HH > LH 且 HL > LL",
+        "desc": "上升趋势需要更多更高的高点和更高的低点",
+        "kb_keywords": ["HH", "HL", "higher high", "higher low", "摆动高", "摆动低", "市场结构"],
+    },
+    {
+        "id": "sma20_location",
+        "name": "价格在SMA20上方运行",
+        "desc": "上升趋势中价格应在SMA20之上，下跌趋势中应在下方",
+        "kb_keywords": ["SMA", "均线", "moving average", "MA20", "SMA20"],
+    },
+    {
+        "id": "sma_alignment",
+        "name": "MA多头排列（SMA20 > SMA50）",
+        "desc": "短期均线在长期均线上方确认上升趋势",
+        "kb_keywords": ["MA排列", "多头排列", "空头排列", "cross", "金叉", "死叉", "SMA50"],
+    },
+    {
+        "id": "trend_bar_majority",
+        "name": "趋势柱数量占优",
+        "desc": "近期K线中顺趋势方向柱体多于逆势方向",
+        "kb_keywords": ["趋势柱", "trend bar", "看涨", "看跌", "bull", "bear"],
+    },
+    {
+        "id": "sma_slope",
+        "name": "SMA20斜率向上",
+        "desc": "上升趋势中SMA20应向上倾斜（最新值大于前值）",
+        "kb_keywords": ["斜率", "slope", "倾斜", "SMA方向", "均线方向"],
+    },
+    {
+        "id": "pullback_depth",
+        "name": "回调不深（未跌破前摆动低点）",
+        "desc": "健康的上升趋势中回调不应跌破前一个摆动低点",
+        "kb_keywords": ["回调", "pullback", "回撤", "前低", "前高", "支撑"],
+    },
+    {
+        "id": "swing_consistency",
+        "name": "摆动一致性（HH/LH比 ≥ 1.5）",
+        "desc": "趋势越强，HH相对LH的优势越明显",
+        "kb_keywords": ["一致", "consistency", "clean", "清晰", "明确"],
+    },
+]
+
+# 知识库文本 → 规则ID 映射模式
+KB_RULE_PATTERNS = [
+    (r"HH.*HL|higher.high.*higher.low|更高.*高[点位]", "swing_structure"),
+    (r"价格.*(?:SMA|均线|MA20).*(?:上[方面]|之上|之下|下[方面])", "sma20_location"),
+    (r"(?:SMA|均线|MA).*(?:排列|交叉|金叉|死叉|多头|空头|bullish|bearish)", "sma_alignment"),
+    (r"(?:趋势|trend).*(?:柱|bar).*(?:占优|多数|多|少|bull|bear)", "trend_bar_majority"),
+    (r"(?:SMA|均线).*(?:斜率|方向|向上|向下|倾斜|slope)", "sma_slope"),
+    (r"(?:回调|回撤|pullback|retrace).*(?:不|未|浅|浅|deep|健康)", "pullback_depth"),
+    (r"(?:一致|consistency|clean|清晰|明确|结构干净)", "swing_consistency"),
+]
+
+
+def match_kb_rules_to_pa(rule_engine):
+    """将知识库提取的文本规则匹配到内置PA规则的ID上
+
+    返回: dict[rule_id] -> list[知识库规则文本]
+    """
+    matched = {}
+    for cat, rules in rule_engine.items():
+        for r in rules:
+            text = r.get("rule", "")
+            for pattern, rule_id in KB_RULE_PATTERNS:
+                if re.search(pattern, text):
+                    if rule_id not in matched:
+                        matched[rule_id] = []
+                    matched[rule_id].append(text)
+                    break
+    return matched
+
+
+def evaluate_pa_trend_rules(candles, h1_result, matched_kb_rules):
+    """逐条执行价格行为趋势规则检查
+
+    Args:
+        candles: 1H K线数据
+        h1_result: analyze_1h 的分析结果
+        matched_kb_rules: match_kb_rules_to_pa() 的返回
+
+    Returns:
+        dict: {
+            "total": int,          # 总规则数
+            "passed": int,         # 通过数
+            "score": int,          # 通过分数 (0~7)
+            "details": [           # 每条的检查结果
+                {
+                    "id": "swing_structure",
+                    "name": "摆动结构...",
+                    "passed": True/False,
+                    "detail": "HH=8 vs LH=2, 优势比4.0 ✅",
+                    "kb_rules": ["知识库原文..."],
+                }
+            ],
+            "kb_matched_count": int,
+            "verdict": "strong_bullish" / "bullish" / "mixed" / "bearish" / "strong_bearish"
+        }
+    """
+    current_price = candles[-1]["close"]
+    sma20 = h1_result.get("sma20", 0)
+    sma50 = h1_result.get("sma50", 0)
+    hh = h1_result["swing"]["HH"]
+    lh = h1_result["swing"]["LH"]
+    hl = h1_result["swing"]["HL"]
+    ll = h1_result["swing"]["LL"]
+    trend_dir = h1_result.get("trend_dir", "RANGE")
+    bull_count = h1_result.get("bull_count_20", 0)
+    bear_count = h1_result.get("bear_count_20", 0)
+    last_swing_low = h1_result.get("last_swing_low", {})
+    prev_swing_low = h1_result.get("prev_swing_low", {})
+
+    results = []
+
+    # 规则1：摆动结构
+    is_up = hh > lh and hl > ll
+    is_down = lh > hh and ll > hl
+    rules_passed = is_up if trend_dir == "UP" else (is_down if trend_dir == "DOWN" else False)
+    detail = f"HH={hh} vs LH={lh}, HL={hl} vs LL={ll}"
+    detail += " ✅ 符合趋势方向" if rules_passed else " ⚠️ 与趋势方向矛盾"
+    results.append({
+        "id": "swing_structure",
+        "name": PA_TREND_RULES[0]["name"],
+        "passed": rules_passed,
+        "detail": detail,
+        "kb_rules": matched_kb_rules.get("swing_structure", []),
+    })
+
+    # 规则2：价格在SMA20上方/下方
+    if sma20:
+        rules_passed = (current_price > sma20 and trend_dir == "UP") or \
+                       (current_price < sma20 and trend_dir == "DOWN")
+        detail = f"现价{current_price:.4f} vs SMA20={sma20:.4f}"
+        detail += f" {'上方 ✅' if current_price > sma20 else '下方'}"
+        detail += " → 符合趋势" if rules_passed else " → 与趋势不一致"
+        results.append({
+            "id": "sma20_location",
+            "name": PA_TREND_RULES[1]["name"],
+            "passed": rules_passed,
+            "detail": detail,
+            "kb_rules": matched_kb_rules.get("sma20_location", []),
+        })
+    else:
+        results.append({
+            "id": "sma20_location", "name": PA_TREND_RULES[1]["name"],
+            "passed": False, "detail": "SMA20无数据",
+            "kb_rules": matched_kb_rules.get("sma20_location", []),
+        })
+
+    # 规则3：MA排列
+    if sma20 and sma50:
+        ma_bullish = sma20 > sma50
+        rules_passed = (ma_bullish and trend_dir == "UP") or (not ma_bullish and trend_dir == "DOWN")
+        detail = f"SMA20={sma20:.4f} vs SMA50={sma50:.4f}"
+        detail += f" 多头排列" if ma_bullish else " 空头排列"
+        detail += " ✅" if rules_passed else " ⚠️ 与趋势方向不一致"
+        results.append({
+            "id": "sma_alignment",
+            "name": PA_TREND_RULES[2]["name"],
+            "passed": rules_passed,
+            "detail": detail,
+            "kb_rules": matched_kb_rules.get("sma_alignment", []),
+        })
+    else:
+        results.append({
+            "id": "sma_alignment", "name": PA_TREND_RULES[2]["name"],
+            "passed": False, "detail": "MA数据不足",
+            "kb_rules": matched_kb_rules.get("sma_alignment", []),
+        })
+
+    # 规则4：趋势柱占优
+    if trend_dir == "UP":
+        rules_passed = bull_count > bear_count
+    elif trend_dir == "DOWN":
+        rules_passed = bear_count > bull_count
+    else:
+        rules_passed = False
+    detail = f"近20根: 看涨{bull_count} 看跌{bear_count}"
+    detail += f" → 顺趋势柱占优 ✅" if rules_passed else " → 逆势柱过多 ⚠️"
+    results.append({
+        "id": "trend_bar_majority",
+        "name": PA_TREND_RULES[3]["name"],
+        "passed": rules_passed,
+        "detail": detail,
+        "kb_rules": matched_kb_rules.get("trend_bar_majority", []),
+    })
+
+    # 规则5：SMA20斜率
+    if sma20 and len(candles) >= 22:
+        sma20_prev = sum(c["close"] for c in candles[-21:-1]) / 20
+        sma20_now = sum(c["close"] for c in candles[-20:]) / 20
+        slope_up = sma20_now > sma20_prev
+        if trend_dir == "UP":
+            rules_passed = slope_up
+        elif trend_dir == "DOWN":
+            rules_passed = not slope_up
+        else:
+            rules_passed = False
+        detail = f"SMA20方向: {'向上 ↗' if slope_up else '向下 ↘'}"
+        detail += " ✅" if rules_passed else " ⚠️"
+        results.append({
+            "id": "sma_slope",
+            "name": PA_TREND_RULES[4]["name"],
+            "passed": rules_passed,
+            "detail": detail,
+            "kb_rules": matched_kb_rules.get("sma_slope", []),
+        })
+    else:
+        results.append({
+            "id": "sma_slope", "name": PA_TREND_RULES[4]["name"],
+            "passed": False, "detail": "数据不足",
+            "kb_rules": matched_kb_rules.get("sma_slope", []),
+        })
+
+    # 规则6：回调深度（不破前低）
+    if trend_dir == "UP" and last_swing_low and prev_swing_low:
+        rules_passed = last_swing_low["price"] >= prev_swing_low["price"]
+        detail = f"最近低点{last_swing_low['price']:.4f} vs 前低{prev_swing_low['price']:.4f}"
+        detail += " → 未破前低 ✅" if rules_passed else " → 跌破前低 ⚠️"
+    elif trend_dir == "DOWN" and last_swing_low and prev_swing_low:
+        rules_passed = last_swing_low["price"] >= prev_swing_low["price"]
+        detail = f"最近低点{last_swing_low['price']:.4f} vs 前低{prev_swing_low['price']:.4f}"
+        detail += " → 未破前低 ✅" if rules_passed else " → 跌破前低 ⚠️"
+    else:
+        rules_passed = False
+        detail = "摆动数据不足"
+    results.append({
+        "id": "pullback_depth",
+        "name": PA_TREND_RULES[5]["name"],
+        "passed": rules_passed,
+        "detail": detail,
+        "kb_rules": matched_kb_rules.get("pullback_depth", []),
+    })
+
+    # 规则7：摆动一致性
+    if hh + lh > 0 and hl + ll > 0:
+        if trend_dir == "UP":
+            ratio_h = hh / max(lh, 1)
+            ratio_l = hl / max(ll, 1)
+            rules_passed = ratio_h >= 1.5 or ratio_l >= 1.5
+            detail = f"HH/LH比={ratio_h:.1f}, HL/LL比={ratio_l:.1f}"
+        elif trend_dir == "DOWN":
+            ratio_h = lh / max(hh, 1)
+            ratio_l = ll / max(hl, 1)
+            rules_passed = ratio_h >= 1.5 or ratio_l >= 1.5
+            detail = f"LH/HH比={ratio_h:.1f}, LL/HL比={ratio_l:.1f}"
+        else:
+            rules_passed = False
+            detail = "震荡市无方向"
+        detail += " ✅" if rules_passed else " ⚠️ 优势不够明显"
+    else:
+        rules_passed = False
+        detail = "摆动数据不足"
+    results.append({
+        "id": "swing_consistency",
+        "name": PA_TREND_RULES[6]["name"],
+        "passed": rules_passed,
+        "detail": detail,
+        "kb_rules": matched_kb_rules.get("swing_consistency", []),
+    })
+
+    # 统计
+    total = len(results)
+    passed_count = sum(1 for r in results if r["passed"])
+    score = passed_count
+    total_kb_matched = sum(len(r["kb_rules"]) for r in results)
+
+    # 趋势质量判定
+    if trend_dir == "UP":
+        if passed_count >= 6:
+            verdict = "strong_bullish"
+        elif passed_count >= 4:
+            verdict = "bullish"
+        else:
+            verdict = "weak_bullish"
+    elif trend_dir == "DOWN":
+        if passed_count >= 6:
+            verdict = "strong_bearish"
+        elif passed_count >= 4:
+            verdict = "bearish"
+        else:
+            verdict = "weak_bearish"
+    else:
+        verdict = "range"
+
+    return {
+        "total": total,
+        "passed": passed_count,
+        "score": score,
+        "details": results,
+        "kb_matched_count": total_kb_matched,
+        "verdict": verdict,
+    }
+
+
+def format_trend_quality_for_push(tq):
+    """将趋势质量评估结果格式化为推送文本"""
+    score_bar = "●" * tq["score"] + "○" * (tq["total"] - tq["score"])
+    verdict_emoji = {
+        "strong_bullish": "🟢🟢",
+        "bullish": "🟢",
+        "weak_bullish": "🟡",
+        "range": "⚪",
+        "weak_bearish": "🟠",
+        "bearish": "🔴",
+        "strong_bearish": "🔴🔴",
+    }
+    emoji = verdict_emoji.get(tq["verdict"], "⚪")
+    lines = [f"📐 趋势质量: {tq['score']}/{tq['total']} {score_bar} {emoji}"]
+
+    for r in tq["details"]:
+        icon = "✅" if r["passed"] else "❌"
+        lines.append(f"  {icon} {r['detail']}")
+
+    if tq["kb_matched_count"] > 0:
+        lines.append(f"  📚 知识库匹配: {tq['kb_matched_count']}条规则参与评估")
+
+    return "\n".join(lines)
+
+
+# ============================================================
 # 分析工具
 # ============================================================
 
@@ -1072,6 +1400,21 @@ def push_notification(h1, m15, plan):
     trend_line += f"，现价{h1['current_price']:.4f}"
     lines.append(trend_line)
 
+    # 趋势质量（知识库规则驱动的PA规则评估）
+    pa_tq = h1.get('pa_trend_quality')
+    if pa_tq:
+        tq_bar = "●" * pa_tq["score"] + "○" * (pa_tq["total"] - pa_tq["score"])
+        tq_emoji = {"strong_bullish": "🟢🟢", "bullish": "🟢", "weak_bullish": "🟡",
+                    "range": "⚪", "weak_bearish": "🟠", "bearish": "🔴", "strong_bearish": "🔴🔴"}
+        emoji = tq_emoji.get(pa_tq["verdict"], "⚪")
+        lines.append(f"📐 趋势质量: {pa_tq['score']}/{pa_tq['total']} {tq_bar} {emoji}")
+        for r in pa_tq["details"]:
+            icon = "✅" if r["passed"] else "❌"
+            if r["kb_rules"]:
+                lines.append(f"  {icon} {r['detail']} 📚")
+            else:
+                lines.append(f"  {icon} {r['detail']}")
+
     # 回调行
     pullback_info = f"📉 回调：15M"
     if 'pullback_pct' in m15:
@@ -1262,6 +1605,14 @@ def main():
     if rule_engine:
         h1_result['kb_enhance_trend'] = apply_knowledge_to_trend(h1_result, rule_engine)
     log(f"  趋势: {h1_result.get('trend', '')} | 方向: {h1_result.get('trend_dir', '')}")
+
+    # 价格行为趋势规则评估（知识库规则+PA规则双驱动）
+    matched_kb = match_kb_rules_to_pa(rule_engine) if rule_engine else {}
+    pa_tq = evaluate_pa_trend_rules(h1_candles, h1_result, matched_kb)
+    h1_result['pa_trend_quality'] = pa_tq
+    log(f"  PA规则评估: {pa_tq['passed']}/{pa_tq['total']} 通过, 质量评级: {pa_tq['verdict']}")
+    if pa_tq['kb_matched_count'] > 0:
+        log(f"  知识库匹配: {pa_tq['kb_matched_count']}条规则参与评估")
 
     log("📊 执行15M回调分析...")
     m15_result = analyze_15m(m15_candles, h1_result)
