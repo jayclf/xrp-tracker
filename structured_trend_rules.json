@@ -1,0 +1,211 @@
+{
+  "version": "1.0",
+  "generated_at": "2026-06-21",
+  "sources": [
+    "Space的知识库",
+    "价格行为｜AI智能体",
+    "价格行为学(1822人)",
+    "价格行为学(1010人)",
+    "Al Brooks 价格行为学"
+  ],
+  "description": "从全量知识库中提取的价格行为趋势判断规则",
+  "rules": [
+    {
+      "rule_id": "pa_swing_structure_up",
+      "name": "摆动结构判定上升趋势",
+      "description": "上升趋势需要更高的高点和更高的低点（Al Brooks核心定义）",
+      "category": "trend",
+      "direction": "UP",
+      "inspected": ["hh_count", "lh_count", "hl_count", "ll_count"],
+      "conditions": [
+        {"left": "hh_count", "operator": ">", "right": "lh_count"},
+        {"left": "hl_count", "operator": ">", "right": "ll_count"}
+      ],
+      "weight": 1.0,
+      "kb_source": "Al Brooks趋势篇, 价格行为学手册"
+    },
+    {
+      "rule_id": "pa_swing_structure_down",
+      "name": "摆动结构判定下跌趋势",
+      "description": "下跌趋势需要更低的低点和更低的高点（Al Brooks核心定义）",
+      "category": "trend",
+      "direction": "DOWN",
+      "inspected": ["hh_count", "lh_count", "hl_count", "ll_count"],
+      "conditions": [
+        {"left": "hh_count", "operator": "<", "right": "lh_count"},
+        {"left": "hl_count", "operator": "<", "right": "ll_count"}
+      ],
+      "weight": 1.0,
+      "kb_source": "Al Brooks趋势篇, 价格行为学手册"
+    },
+    {
+      "rule_id": "pa_price_vs_sma20_up",
+      "name": "价格在SMA20上方",
+      "description": "上升趋势中收盘价应位于SMA20之上，大部分K线在均线同一侧（Al Brooks 20均线确认法）",
+      "category": "trend",
+      "direction": "UP",
+      "inspected": ["close", "sma20"],
+      "conditions": [
+        {"left": "close", "operator": ">", "right": "sma20"}
+      ],
+      "weight": 0.8,
+      "kb_source": "Al Brooks, 移动平均线趋势识别方法"
+    },
+    {
+      "rule_id": "pa_price_vs_sma20_down",
+      "name": "价格在SMA20下方",
+      "description": "下跌趋势中收盘价应位于SMA20之下",
+      "category": "trend",
+      "direction": "DOWN",
+      "inspected": ["close", "sma20"],
+      "conditions": [
+        {"left": "close", "operator": "<", "right": "sma20"}
+      ],
+      "weight": 0.8,
+      "kb_source": "Al Brooks, 移动平均线趋势识别方法"
+    },
+    {
+      "rule_id": "pa_ma_alignment_up",
+      "name": "均线多头排列确认",
+      "description": "短期均线(SMA20)在长期均线(SMA50)上方确认上升趋势，均线向上倾斜",
+      "category": "trend",
+      "direction": "UP",
+      "inspected": ["sma20", "sma50", "sma20_slope"],
+      "conditions": [
+        {"left": "sma20", "operator": ">", "right": "sma50"}
+      ],
+      "weight": 0.9,
+      "kb_source": "价格行为学手册, 3种使用移动平均线识别趋势的方法"
+    },
+    {
+      "rule_id": "pa_ma_alignment_down",
+      "name": "均线空头排列确认",
+      "description": "短期均线(SMA20)在长期均线(SMA50)下方确认下跌趋势",
+      "category": "trend",
+      "direction": "DOWN",
+      "inspected": ["sma20", "sma50", "sma20_slope"],
+      "conditions": [
+        {"left": "sma20", "operator": "<", "right": "sma50"}
+      ],
+      "weight": 0.9,
+      "kb_source": "价格行为学手册"
+    },
+    {
+      "rule_id": "pa_trend_bar_dominance_up",
+      "name": "看涨趋势柱占优",
+      "description": "近期K线中看涨柱体数量应多于看跌柱体，体现趋势K线的连续性",
+      "category": "trend",
+      "direction": "UP",
+      "inspected": ["bull_count_20", "bear_count_20"],
+      "conditions": [
+        {"left": "trendbar_ratio", "operator": ">", "right": "1.2"}
+      ],
+      "weight": 0.7,
+      "kb_source": "Al Brooks价格行为交易, 价格行为学手册"
+    },
+    {
+      "rule_id": "pa_trend_bar_dominance_down",
+      "name": "看跌趋势柱占优",
+      "description": "近期K线中看跌柱体数量应多于看涨柱体",
+      "category": "trend",
+      "direction": "DOWN",
+      "inspected": ["bull_count_20", "bear_count_20"],
+      "conditions": [
+        {"left": "trendbar_ratio", "operator": "<", "right": "0.8"}
+      ],
+      "weight": 0.7,
+      "kb_source": "Al Brooks价格行为交易"
+    },
+    {
+      "rule_id": "pa_sma_slope_up",
+      "name": "SMA20斜率向上确认",
+      "description": "上升趋势中SMA20应呈上升趋势（最新值大于前值）",
+      "category": "trend",
+      "direction": "UP",
+      "inspected": ["sma20_slope"],
+      "conditions": [
+        {"left": "sma20_slope", "operator": ">", "right": "0"}
+      ],
+      "weight": 0.7,
+      "kb_source": "移动平均线趋势识别方法"
+    },
+    {
+      "rule_id": "pa_sma_slope_down",
+      "name": "SMA20斜率向下确认",
+      "description": "下跌趋势中SMA20应呈下降趋势",
+      "category": "trend",
+      "direction": "DOWN",
+      "inspected": ["sma20_slope"],
+      "conditions": [
+        {"left": "sma20_slope", "operator": "<", "right": "0"}
+      ],
+      "weight": 0.7,
+      "kb_source": "移动平均线趋势识别方法"
+    },
+    {
+      "rule_id": "pa_pullback_hold_up",
+      "name": "回调不破前低",
+      "description": "健康的上升趋势中回调不应跌破前一个摆动低点，保持缺口不被封闭（Al Brooks缺口规则）",
+      "category": "trend",
+      "direction": "UP",
+      "inspected": ["last_swing_low", "prev_swing_low"],
+      "conditions": [
+        {"left": "last_swing_low_price", "operator": ">=", "right": "prev_swing_low_price"}
+      ],
+      "weight": 0.8,
+      "kb_source": "Al Brooks, 价格行为学手册"
+    },
+    {
+      "rule_id": "pa_pullback_hold_down",
+      "name": "反弹不破前高",
+      "description": "健康的下跌趋势中反弹不应突破前一个摆动高点",
+      "category": "trend",
+      "direction": "DOWN",
+      "inspected": ["last_swing_high", "prev_swing_high"],
+      "conditions": [
+        {"left": "last_swing_high_price", "operator": "<=", "right": "prev_swing_high_price"}
+      ],
+      "weight": 0.8,
+      "kb_source": "Al Brooks, 价格行为学手册"
+    },
+    {
+      "rule_id": "pa_swing_consistency_up",
+      "name": "上升趋势摆动一致性",
+      "description": "强趋势中HH相对LH应有明显优势，HH/LH比值>=1.5",
+      "category": "trend",
+      "direction": "UP",
+      "inspected": ["hh_count", "lh_count", "hl_count", "ll_count"],
+      "conditions": [
+        {"left": "hh_count", "operator": ">=", "right": "lh_count * 1.5"}
+      ],
+      "weight": 0.6,
+      "kb_source": "价格行为学系统手册"
+    },
+    {
+      "rule_id": "pa_swing_consistency_down",
+      "name": "下跌趋势摆动一致性",
+      "description": "强趋势中LH相对HH应有明显优势，LH/HH比值>=1.5",
+      "category": "trend",
+      "direction": "DOWN",
+      "inspected": ["hh_count", "lh_count", "hl_count", "ll_count"],
+      "conditions": [
+        {"left": "lh_count", "operator": ">=", "right": "hh_count * 1.5"}
+      ],
+      "weight": 0.6,
+      "kb_source": "价格行为学系统手册"
+    },
+    {
+      "rule_id": "pa_consecutive_confidence",
+      "name": "连续趋势K线确认（Always In）",
+      "description": "2根连续同向强趋势K线确认趋势方向，若连续3根则高度确认（Always In判定核心）",
+      "category": "trend",
+      "direction": "ALL",
+      "inspected": ["consecutive_bull_bars", "consecutive_bear_bars"],
+      "conditions": [
+        {"left": "consecutive_bull_bars", "operator": ">=", "right": "2"}
+      ],
+      "weight": 0.9,
+      "kb_source": "价格行为学手册(1) Always In判定方法"
+    }
+  ]
+}
