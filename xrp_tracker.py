@@ -947,6 +947,285 @@ def format_trend_quality_for_push(tq):
 
 
 # ============================================================
+# 结构化规则引擎（知识库→JSON规则→可执行检查）
+# ============================================================
+
+STRUCTURED_RULES_CACHE_FILE = os.path.join(OUTPUT_DIR, "cached_structured_rules.json")
+STRUCTURED_RULES_CACHE_HOURS = 24  # 缓存有效期
+
+
+def load_rule_cache():
+    """加载缓存的规则，如果过期或不存在返回 None"""
+    if not os.path.exists(STRUCTURED_RULES_CACHE_FILE):
+        return None
+    try:
+        with open(STRUCTURED_RULES_CACHE_FILE, "r") as f:
+            cache = json.load(f)
+        cached_time = cache.get("cached_at", 0)
+        age_hours = (time.time() - cached_time) / 3600
+        if age_hours < STRUCTURED_RULES_CACHE_HOURS:
+            log(f"  📦 规则缓存有效 ({age_hours:.1f}h < {STRUCTURED_RULES_CACHE_HOURS}h)")
+            return cache.get("rules", [])
+        log(f"  📦 规则缓存已过期 ({age_hours:.1f}h >= {STRUCTURED_RULES_CACHE_HOURS}h)")
+        return None
+    except Exception as e:
+        log(f"  ⚠️ 读取规则缓存失败: {e}")
+        return None
+
+
+def save_rule_cache(rules):
+    """保存规则到缓存"""
+    try:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        with open(STRUCTURED_RULES_CACHE_FILE, "w") as f:
+            json.dump({
+                "cached_at": time.time(),
+                "rules": rules,
+            }, f, ensure_ascii=False, indent=2)
+        log(f"  📦 规则已缓存: {len(rules)} 条")
+    except Exception as e:
+        log(f"  ⚠️ 保存规则缓存失败: {e}")
+
+
+def extract_structured_rules(knowledge):
+    """用星火从知识库文本中提取结构化JSON规则
+
+    Args:
+        knowledge: fetch_knowledge_rules() 的返回
+                   dict[category] -> list[dict(title, text, ...)]
+
+    Returns:
+        list[dict]: 结构化规则列表
+    """
+    if not XF_SPARK_ENABLED:
+        log("  ⚡ 星火未启用，跳过结构化规则提取")
+        return []
+
+    # 先检查缓存
+    cached = load_rule_cache()
+    if cached is not None:
+        return cached
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        log("  ⚠️ openai 未安装，无法提取结构化规则")
+        return []
+
+    # 拼接知识库文本（优先 trend 和 support_resistance 类）
+    feed_texts = []
+    priority_cats = ["trend", "support_resistance", "signal", "entry_exit", "pullback"]
+    for cat in priority_cats:
+        docs = knowledge.get(cat, [])
+        for doc in docs:
+            text = doc.get("text", "")
+            if text:
+                feed_texts.append(f"--- [{cat}] {doc['title']} ---\n{text[:1500]}")
+
+    feed = "\n\n".join(feed_texts)
+    if len(feed) > 8000:
+        feed = feed[:8000] + "\n...(截断)"
+
+    if not feed.strip():
+        log("  ⚡ 知识库为空，无法提取规则")
+        return []
+
+    log(f"  ⚡ 提取结构化规则 ({len(feed)} chars)...")
+
+    client = OpenAI(
+        base_url=XF_SPARK_BASE_URL,
+        api_key=XF_SPARK_API_KEY,
+    )
+
+    prompt = f"""你是一个价格行为交易规则提取器。从下面的交易文档中提取趋势判断规则，按严格的JSON格式返回。
+
+规则模板示例：
+{{
+  "rule_id": "trend_001",
+  "name": "规则名称",
+  "category": "trend",
+  "direction": "UP",
+  "inspected": ["close", "sma20"],
+  "conditions": [
+    {{"left": "close", "operator": ">", "right": "sma20"}}
+  ],
+  "weight": 0.8
+}}
+
+支持的operator: > < >= <= ==
+支持的指标名:
+- close（收盘价）, sma20, sma50
+- hh_count（HH计数）, lh_count（LH计数）
+- hl_count（HL计数）, ll_count（LL计数）
+- prev_swing_low（前摆动低点）, prev_swing_high（前摆动高点）
+- trendbar_ratio（趋势柱比值）
+
+提取要求：
+1. 只提取与趋势判断直接相关的规则
+2. direction：规则适用方向（UP/DOWN/ALL）
+3. category：固定为"trend"
+4. 每条规则最多3个条件
+5. weight：0.1~1.0，越重要权重越高
+6. 如果文档没有明确趋势规则，返回空数组[]
+
+--- 文档内容 ---
+{feed}
+
+--- 输出 ---
+请只输出JSON数组，不要包含其他文字："""
+
+    try:
+        resp = client.chat.completions.create(
+            model=XF_SPARK_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2000,
+            temperature=0.1,
+        )
+        raw = resp.choices[0].message.content.strip()
+        log(f"  ⚡ 星火返回: {raw[:200]}...")
+
+        # 提取JSON数组
+        json_start = raw.find("[")
+        json_end = raw.rfind("]")
+        if json_start >= 0 and json_end > json_start:
+            json_str = raw[json_start:json_end + 1]
+            rules = json.loads(json_str)
+            if isinstance(rules, list):
+                # 验证并过滤
+                valid_rules = [r for r in rules if isinstance(r, dict) and r.get("conditions")]
+                log(f"  ⚡ 提取到 {len(valid_rules)} 条有效规则")
+                if valid_rules:
+                    save_rule_cache(valid_rules)
+                    return valid_rules
+    except Exception as e:
+        log(f"  ⚠️ 结构化规则提取失败: {e}")
+
+    return []
+
+
+def resolve_metric(metric_name, candles, h1_result):
+    """将规则中的指标名解析为实际数值"""
+    if metric_name == "close":
+        return candles[-1]["close"] if candles else None
+    if metric_name == "sma20":
+        return h1_result.get("sma20")
+    if metric_name == "sma50":
+        return h1_result.get("sma50")
+    if metric_name == "hh_count":
+        return h1_result["swing"]["HH"]
+    if metric_name == "lh_count":
+        return h1_result["swing"]["LH"]
+    if metric_name == "hl_count":
+        return h1_result["swing"]["HL"]
+    if metric_name == "ll_count":
+        return h1_result["swing"]["LL"]
+    if metric_name == "prev_swing_low":
+        sl = h1_result.get("last_swing_low")
+        return sl["price"] if sl else None
+    if metric_name == "prev_swing_high":
+        sh = h1_result.get("last_swing_high")
+        return sh["price"] if sh else None
+    if metric_name == "trendbar_ratio":
+        bull = h1_result.get("bull_count_20", 0)
+        bear = h1_result.get("bear_count_20", 0)
+        return bull / max(bear, 1)
+    return None
+
+
+def execute_structured_rules(rules, candles, h1_result):
+    """执行结构化规则检查
+
+    Args:
+        rules: extract_structured_rules() 返回的规则列表
+        candles: 1H K线数据
+        h1_result: analyze_1h() 结果
+
+    Returns:
+        dict: {
+            "total": int,
+            "passed": int,
+            "details": [{"name", "passed", "detail", "weight"}],
+            "score": int,
+        }
+    """
+    trend_dir = h1_result.get("trend_dir", "RANGE")
+    results = []
+
+    for rule in rules:
+        rule_dir = rule.get("direction", "ALL")
+        # 跳过方向不匹配的规则
+        if rule_dir not in ("ALL", trend_dir):
+            continue
+
+        conditions = rule.get("conditions", [])
+        if not conditions:
+            continue
+
+        passed_count = 0
+        total_cond = len(conditions)
+        cond_details = []
+
+        for cond in conditions:
+            left = resolve_metric(cond.get("left", ""), candles, h1_result)
+            right = resolve_metric(cond.get("right", ""), candles, h1_result)
+            op = cond.get("operator", "")
+
+            if left is None or right is None:
+                cond_details.append(f"{cond.get('left','?')} ? {cond.get('right','?')} → 数据不足")
+                continue
+
+            try:
+                left = float(left)
+                right = float(right)
+                if op == ">" and left > right:
+                    passed_count += 1
+                    cond_details.append(f"{left:.4f} > {right:.4f} ✅")
+                elif op == ">=" and left >= right:
+                    passed_count += 1
+                    cond_details.append(f"{left:.4f} >= {right:.4f} ✅")
+                elif op == "<" and left < right:
+                    passed_count += 1
+                    cond_details.append(f"{left:.4f} < {right:.4f} ✅")
+                elif op == "<=" and left <= right:
+                    passed_count += 1
+                    cond_details.append(f"{left:.4f} <= {right:.4f} ✅")
+                elif op == "==" and abs(left - right) < 0.0001:
+                    passed_count += 1
+                    cond_details.append(f"{left:.4f} == {right:.4f} ✅")
+                else:
+                    cond_details.append(f"{left:.4f} {op} {right:.4f} ❌")
+            except (ValueError, TypeError):
+                cond_details.append(f"{left} {op} {right} → 解析失败")
+
+        rule_passed = passed_count == total_cond
+        weight = rule.get("weight", 0.5)
+        results.append({
+            "name": rule.get("name", "未命名规则"),
+            "passed": rule_passed,
+            "detail": " | ".join(cond_details),
+            "weight": weight,
+            "passed_conds": passed_count,
+            "total_conds": total_cond,
+        })
+
+    if not results:
+        return {"total": 0, "passed": 0, "details": [], "score": 0}
+
+    # 加权评分
+    total_weight = sum(r["weight"] for r in results)
+    passed_weight = sum(r["weight"] for r in results if r["passed"])
+    weighted_score = int(passed_weight / total_weight * 100) if total_weight > 0 else 0
+
+    return {
+        "total": len(results),
+        "passed": sum(1 for r in results if r["passed"]),
+        "details": results,
+        "score": weighted_score,
+        "weighted_pct": f"{weighted_score}%",
+    }
+
+
+# ============================================================
 # 分析工具
 # ============================================================
 
@@ -1419,6 +1698,15 @@ def push_notification(h1, m15, plan):
         else:
             lines.append(f"📐 趋势质量: 震荡市 ⚪ 规则不适用")
 
+    # 结构化规则结果（知识库驱动的可执行规则）
+    sr = h1.get('structured_rules')
+    if sr and sr["total"] > 0:
+        sr_bar = "●" * int(sr["score"] / 20) + "○" * (5 - int(sr["score"] / 20))
+        lines.append(f"📏 结构化规则: {sr['passed']}/{sr['total']} ✅ ({sr['weighted_pct']} 加权)")
+        for r in sr["details"][:2]:  # 最多2条省空间
+            icon = "✅" if r["passed"] else "❌"
+            lines.append(f"  {icon} {r['name']}: {r['detail']}")
+
     # 回调行
     pullback_info = f"📉 回调：15M"
     if 'pullback_pct' in m15:
@@ -1580,11 +1868,16 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     rule_engine = {}
     knowledge = {}
+    structured_rules = []
     try:
         knowledge = fetch_knowledge_rules()
         rule_engine = build_rule_engine(knowledge)
+        # 结构化规则提取（星火从KB文本提取JSON规则，有缓存）
+        log("⚡ 提取结构化规则...")
+        structured_rules = extract_structured_rules(knowledge)
     except Exception as e:
         log(f"  ⚠️ 知识库集成失败: {e}，继续使用内置规则")
+        structured_rules = []
 
     # 2. 拉取数据
     log("📥 拉取1H数据...")
@@ -1617,6 +1910,15 @@ def main():
     log(f"  PA规则评估: {pa_tq['passed']}/{pa_tq['total']} 通过, 质量评级: {pa_tq['verdict']}" if pa_tq['score'] is not None else f"  PA规则评估: 震荡市, 不适用")
     if pa_tq['kb_matched_count'] > 0:
         log(f"  知识库匹配: {pa_tq['kb_matched_count']}条规则参与评估")
+
+    # 结构化规则执行（知识库→星火提取的JSON规则）
+    if structured_rules:
+        sr_result = execute_structured_rules(structured_rules, h1_candles, h1_result)
+        h1_result['structured_rules'] = sr_result
+        if sr_result["total"] > 0:
+            log(f"  结构化规则: {sr_result['passed']}/{sr_result['total']} 通过 (加权{sr_result['weighted_pct']})")
+        else:
+            log("  结构化规则: 无匹配当前方向的规则")
 
     log("📊 执行15M回调分析...")
     m15_result = analyze_15m(m15_candles, h1_result)
