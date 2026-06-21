@@ -216,15 +216,13 @@ def download_pdf_text(media_id, kb_id=None):
 
     Args:
         media_id: 媒体ID
-        kb_id: 所属知识库ID，默认用 IMA_KB_ID
+        kb_id: 所属知识库ID（get_media_info不需要此参数，保留仅供兼容）
     """
-    kid = kb_id or IMA_KB_ID
-    if not IMA_CLIENT_ID or not IMA_API_KEY or not kid:
+    if not IMA_CLIENT_ID or not IMA_API_KEY:
         return ""
 
     data = ima_request("get_media_info", {
         "media_id": media_id,
-        "knowledge_base_id": kid,
     })
     if not data:
         return ""
@@ -1114,7 +1112,44 @@ def extract_structured_rules(knowledge):
 
 
 def resolve_metric(metric_name, candles, h1_result):
-    """将规则中的指标名解析为实际数值"""
+    """将规则中的指标名解析为实际数值，支持数值常量和简单表达式"""
+    if not metric_name or not isinstance(metric_name, str):
+        try:
+            return float(metric_name)
+        except (ValueError, TypeError):
+            return None
+    
+    metric_name = metric_name.strip()
+    
+    # 数值常量
+    try:
+        return float(metric_name)
+    except ValueError:
+        pass
+    
+    # 简单表达式：metric * number
+    if "*" in metric_name:
+        parts = metric_name.split("*")
+        if len(parts) == 2:
+            base = resolve_metric(parts[0].strip(), candles, h1_result)
+            try:
+                mult = float(parts[1].strip())
+                return base * mult if base is not None else None
+            except ValueError:
+                pass
+    
+    # metric / number
+    if "/" in metric_name:
+        parts = metric_name.split("/")
+        if len(parts) == 2:
+            base = resolve_metric(parts[0].strip(), candles, h1_result)
+            try:
+                div = float(parts[1].strip())
+                return base / div if base is not None and div != 0 else None
+            except ValueError:
+                pass
+    
+    # 标准指标
     if metric_name == "close":
         return candles[-1]["close"] if candles else None
     if metric_name == "sma20":
@@ -1129,16 +1164,40 @@ def resolve_metric(metric_name, candles, h1_result):
         return h1_result["swing"]["HL"]
     if metric_name == "ll_count":
         return h1_result["swing"]["LL"]
-    if metric_name == "prev_swing_low":
+    if metric_name in ("prev_swing_low", "last_swing_low_price"):
         sl = h1_result.get("last_swing_low")
         return sl["price"] if sl else None
-    if metric_name == "prev_swing_high":
+    if metric_name in ("prev_swing_high", "last_swing_high_price"):
         sh = h1_result.get("last_swing_high")
+        return sh["price"] if sh else None
+    if metric_name == "prev_swing_low_price":
+        sl = h1_result.get("prev_swing_low")
+        return sl["price"] if sl else None
+    if metric_name == "prev_swing_high_price":
+        sh = h1_result.get("prev_swing_high")  # 没有prev_swing_high，用last_swing_high
         return sh["price"] if sh else None
     if metric_name == "trendbar_ratio":
         bull = h1_result.get("bull_count_20", 0)
         bear = h1_result.get("bear_count_20", 0)
         return bull / max(bear, 1)
+    if metric_name == "sma20_slope":
+        sma20 = h1_result.get("sma20")
+        sma20_prev = h1_result.get("sma20_prev")
+        if sma20 is not None and sma20_prev is not None:
+            return sma20 - sma20_prev
+        return None
+    if metric_name in ("consecutive_bull_bars", "consecutive_bear_bars"):
+        count = 0
+        max_count = 0
+        is_bull = metric_name == "consecutive_bull_bars"
+        for c in reversed(candles[-30:]):
+            if (is_bull and c["close"] > c["open"]) or (not is_bull and c["close"] < c["open"]):
+                count += 1
+                max_count = max(max_count, count)
+            else:
+                count = 0
+        return max_count
+    
     return None
 
 
@@ -1336,6 +1395,11 @@ def analyze_1h(candles):
     sma50 = calc_sma(candles, 50)
     result['sma20'] = sma20
     result['sma50'] = sma50
+    # SMA20前值（用于计算斜率）
+    if len(candles) >= 22:
+        result['sma20_prev'] = sum(c["close"] for c in candles[-21:-1]) / 20
+    else:
+        result['sma20_prev'] = sma20
     result['above_sma20'] = current_price > sma20 if sma20 else None
     result['above_sma50'] = current_price > sma50 if sma50 else None
     result['ma_bullish'] = sma20 and sma50 and sma20 > sma50
@@ -1873,21 +1937,36 @@ def detect_changes(h1, m15, plan):
 def main():
     log("🚀 开始执行 XRP-USDT 跟踪分析...")
 
-    # 1. 知识库规则提取
-    log("📚 搜索知识库规则...")
+    # 1. 加载结构化规则（优先本地文件，后备KB提取→内置规则）
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     rule_engine = {}
     knowledge = {}
     structured_rules = []
-    try:
-        knowledge = fetch_knowledge_rules()
-        rule_engine = build_rule_engine(knowledge)
-        # 结构化规则提取（星火从KB文本提取JSON规则，有缓存）
-        log("⚡ 提取结构化规则...")
-        structured_rules = extract_structured_rules(knowledge)
-    except Exception as e:
-        log(f"  ⚠️ 知识库集成失败: {e}，继续使用内置规则")
-        structured_rules = []
+    
+    # 脚本所在目录下的规则文件
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    rules_path = os.path.join(script_dir, "structured_trend_rules.json")
+    
+    if os.path.exists(rules_path):
+        try:
+            with open(rules_path, "r") as f:
+                rules_data = json.load(f)
+            structured_rules = rules_data.get("rules", [])
+            log(f"📚 加载规则文件: {rules_data.get('version', 'N/A')}, {len(structured_rules)}条规则")
+            log(f"   来源: {', '.join(rules_data.get('sources', ['内置']))}")
+        except Exception as e:
+            log(f"  ⚠️ 规则文件读取失败: {e}")
+            structured_rules = []
+    
+    # 尝试KB提取文本规则（失败不阻塞）
+    if not structured_rules:
+        log("📚 搜索知识库规则（后备）...")
+        try:
+            knowledge = fetch_knowledge_rules()
+            rule_engine = build_rule_engine(knowledge)
+            structured_rules = extract_structured_rules(knowledge)
+        except Exception as e:
+            log(f"  ⚠️ 知识库集成失败: {e}")
 
     # 2. 拉取数据
     log("📥 拉取1H数据...")
