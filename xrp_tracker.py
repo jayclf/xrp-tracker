@@ -1916,11 +1916,32 @@ def main():
         log(f"  知识库匹配: {pa_tq['kb_matched_count']}条规则参与评估")
 
     # 结构化规则执行（知识库→星火提取的JSON规则）
-    if structured_rules:
+    # 如果星火提取失败，用内置PA规则作为后备
+    if not structured_rules:
+        # 将内置PA规则转为结构化格式
+        sr_defs = [
+            {"name": "摆动结构", "direction": "ALL", "weight": 1.0,
+             "conditions": [{"left": "hh_count", "operator": ">", "right": "lh_count"},
+                           {"left": "hl_count", "operator": ">", "right": "ll_count"}]},
+            {"name": "价格在SMA20上方", "direction": "UP", "weight": 0.8,
+             "conditions": [{"left": "close", "operator": ">", "right": "sma20"}]},
+            {"name": "价格在SMA20下方", "direction": "DOWN", "weight": 0.8,
+             "conditions": [{"left": "close", "operator": "<", "right": "sma20"}]},
+            {"name": "MA排列", "direction": "ALL", "weight": 0.9,
+             "conditions": [{"left": "sma20", "operator": ">", "right": "sma50"}]},
+            {"name": "趋势柱占优", "direction": "UP", "weight": 0.6,
+             "conditions": [{"left": "trendbar_ratio", "operator": ">", "right": "1"}]},
+            {"name": "趋势柱占优", "direction": "DOWN", "weight": 0.6,
+             "conditions": [{"left": "trendbar_ratio", "operator": "<", "right": "1"}]},
+        ]
+        sr_result = execute_structured_rules(sr_defs, h1_candles, h1_result)
+        h1_result['structured_rules'] = sr_result
+        log(f"  PA内置规则: {sr_result['passed']}/{sr_result['total']} 通过 (加权{sr_result['weighted_pct']})")
+    else:
         sr_result = execute_structured_rules(structured_rules, h1_candles, h1_result)
         h1_result['structured_rules'] = sr_result
         if sr_result["total"] > 0:
-            log(f"  结构化规则: {sr_result['passed']}/{sr_result['total']} 通过 (加权{sr_result['weighted_pct']})")
+            log(f"  结构化规则(KB): {sr_result['passed']}/{sr_result['total']} 通过 (加权{sr_result['weighted_pct']})")
         else:
             log("  结构化规则: 无匹配当前方向的规则")
 
