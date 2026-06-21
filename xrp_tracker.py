@@ -909,6 +909,7 @@ def evaluate_pa_trend_rules(candles, h1_result, matched_kb_rules):
             verdict = "weak_bearish"
     else:
         verdict = "range"
+        score = None  # 震荡市不评分
 
     return {
         "total": total,
@@ -1403,17 +1404,20 @@ def push_notification(h1, m15, plan):
     # 趋势质量（知识库规则驱动的PA规则评估）
     pa_tq = h1.get('pa_trend_quality')
     if pa_tq:
-        tq_bar = "●" * pa_tq["score"] + "○" * (pa_tq["total"] - pa_tq["score"])
-        tq_emoji = {"strong_bullish": "🟢🟢", "bullish": "🟢", "weak_bullish": "🟡",
-                    "range": "⚪", "weak_bearish": "🟠", "bearish": "🔴", "strong_bearish": "🔴🔴"}
-        emoji = tq_emoji.get(pa_tq["verdict"], "⚪")
-        lines.append(f"📐 趋势质量: {pa_tq['score']}/{pa_tq['total']} {tq_bar} {emoji}")
-        for r in pa_tq["details"]:
-            icon = "✅" if r["passed"] else "❌"
-            if r["kb_rules"]:
-                lines.append(f"  {icon} {r['detail']} 📚")
-            else:
-                lines.append(f"  {icon} {r['detail']}")
+        if pa_tq["score"] is not None:
+            tq_bar = "●" * pa_tq["score"] + "○" * (pa_tq["total"] - pa_tq["score"])
+            tq_emoji = {"strong_bullish": "🟢🟢", "bullish": "🟢", "weak_bullish": "🟡",
+                        "range": "⚪", "weak_bearish": "🟠", "bearish": "🔴", "strong_bearish": "🔴🔴"}
+            emoji = tq_emoji.get(pa_tq["verdict"], "⚪")
+            lines.append(f"📐 趋势质量: {pa_tq['score']}/{pa_tq['total']} {tq_bar} {emoji}")
+            for r in pa_tq["details"]:
+                icon = "✅" if r["passed"] else "❌"
+                if r["kb_rules"]:
+                    lines.append(f"  {icon} {r['detail']} 📚")
+                else:
+                    lines.append(f"  {icon} {r['detail']}")
+        else:
+            lines.append(f"📐 趋势质量: 震荡市 ⚪ 规则不适用")
 
     # 回调行
     pullback_info = f"📉 回调：15M"
@@ -1610,7 +1614,7 @@ def main():
     matched_kb = match_kb_rules_to_pa(rule_engine) if rule_engine else {}
     pa_tq = evaluate_pa_trend_rules(h1_candles, h1_result, matched_kb)
     h1_result['pa_trend_quality'] = pa_tq
-    log(f"  PA规则评估: {pa_tq['passed']}/{pa_tq['total']} 通过, 质量评级: {pa_tq['verdict']}")
+    log(f"  PA规则评估: {pa_tq['passed']}/{pa_tq['total']} 通过, 质量评级: {pa_tq['verdict']}" if pa_tq['score'] is not None else f"  PA规则评估: 震荡市, 不适用")
     if pa_tq['kb_matched_count'] > 0:
         log(f"  知识库匹配: {pa_tq['kb_matched_count']}条规则参与评估")
 
