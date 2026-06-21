@@ -294,7 +294,13 @@ def spark_ocr_pdf(pdf_data, text_by_page=None):
     if text_by_page is None:
         text_by_page = {}
 
-    doc = fitz.open(stream=pdf_data, filetype="pdf")
+    try:
+        doc = fitz.open(stream=pdf_data, filetype="pdf")
+    except Exception as e:
+        log(f"  ⚠️ 文件不是PDF格式或已损坏: {e}")
+        # 返回PyPDF2的文本（如果有）
+        text = "\n".join(t for t in text_by_page.values() if t)
+        return text if text else ""
     total_pages = len(doc)
     pages_to_process = min(total_pages, XF_SPARK_MAX_PAGES)
     log(f"  [XF Spark] PDF has {total_pages} pages, processing first {pages_to_process} pages...")
