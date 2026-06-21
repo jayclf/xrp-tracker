@@ -62,11 +62,11 @@ OUTPUT_DIR = os.environ.get("TRACKER_OUTPUT_DIR", os.path.join(os.getcwd(), "out
 
 # 知识库搜索关键词（按分析阶段分组）
 KB_SEARCH_QUERIES = {
-    "trend": ["趋势", "趋势线", "market structure", "swing", "摆动"],
-    "pullback": ["回调", "pullback", "retracement", "回撤"],
-    "signal": ["pin bar", "吞没", "engulfing", "K线形态", "蜡烛图", "price action pattern"],
-    "support_resistance": ["支撑阻力", "support resistance", "供需"],
-    "entry_exit": ["入场", "止损", "entry", "stop loss", "风险管理", "仓位管理"],
+    "trend": ["趋势", "趋势线", "market structure", "swing", "摆动", "上涨", "下跌", "价格行为"],
+    "pullback": ["回调", "pullback", "retracement", "回撤", "回调交易"],
+    "signal": ["pin bar", "吞没", "engulfing", "K线形态", "蜡烛图", "price action pattern", "信号"],
+    "support_resistance": ["支撑阻力", "support resistance", "供需", "支撑", "阻力"],
+    "entry_exit": ["入场", "止损", "entry", "stop loss", "风险管理", "仓位管理", "规则"],
 }
 
 MAX_PDF_PER_CATEGORY = 3
@@ -1037,42 +1037,46 @@ def extract_structured_rules(knowledge):
         api_key=XF_SPARK_API_KEY,
     )
 
-    prompt = f"""你是一个价格行为交易规则提取器。从下面的交易文档中提取趋势判断规则，按严格的JSON格式返回。
+    prompt = f"""你是一个价格行为交易专家，擅长从交易文档中提取可执行的趋势判断规则。
 
-规则模板示例：
+从以下文档内容中，提取所有与**趋势方向判断**相关的规则，输出为JSON数组。
+
+规则模板：
 {{
-  "rule_id": "trend_001",
+  "rule_id": "趋势规则的唯一ID",
   "name": "规则名称",
   "category": "trend",
-  "direction": "UP",
-  "inspected": ["close", "sma20"],
+  "direction": "规则适用的趋势方向（UP/DOWN/ALL）",
+  "description": "规则描述",
+  "inspected": ["规则检查用到的指标名列表"],
   "conditions": [
-    {{"left": "close", "operator": ">", "right": "sma20"}}
+    {{"left": "指标A", "operator": "操作符", "right": "指标B"}}
   ],
-  "weight": 0.8
+  "weight": 权重0.1~1.0
 }}
 
-支持的operator: > < >= <= ==
-支持的指标名:
-- close（收盘价）, sma20, sma50
-- hh_count（HH计数）, lh_count（LH计数）
-- hl_count（HL计数）, ll_count（LL计数）
-- prev_swing_low（前摆动低点）, prev_swing_high（前摆动高点）
-- trendbar_ratio（趋势柱比值）
+操作符说明：> < >= <= ==
+支持的指标名：
+- close（收盘价）, sma20（20周期均线）, sma50（50周期均线）
+- hh_count（更高高点计数）, lh_count（更低高点计数）
+- hl_count（更高低点计数）, ll_count（更低低点计数）
+- prev_swing_low（前一个摆动低点）, prev_swing_high（前一个摆动高点）
+- trendbar_ratio（趋势柱比值, >1表示多头占优）
 
-提取要求：
-1. 只提取与趋势判断直接相关的规则
-2. direction：规则适用方向（UP/DOWN/ALL）
-3. category：固定为"trend"
-4. 每条规则最多3个条件
-5. weight：0.1~1.0，越重要权重越高
-6. 如果文档没有明确趋势规则，返回空数组[]
+提取规则示例（从叙事文本推理）：
+- 原文："上升趋势中价格应位于均线上方"
+  → conditions: [{{"left": "close", "operator": ">", "right": "sma20"}}]
+- 原文："更高的高点和更高的低点构成上升趋势"
+  → conditions: [{{"left": "hh_count", "operator": ">", "right": "lh_count"}}, {{"left": "hl_count", "operator": ">", "right": "ll_count"}}]
+
+注意：即使文档没有明确写成规则格式，只要提到了趋势判断条件，就提取出来。
+如果完全没有趋势判断相关的内容，返回空数组[]。
 
 --- 文档内容 ---
 {feed}
 
 --- 输出 ---
-请只输出JSON数组，不要包含其他文字："""
+只输出JSON数组，不要包含其他文字："""
 
     try:
         resp = client.chat.completions.create(
