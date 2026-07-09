@@ -1931,6 +1931,181 @@ def detect_changes(h1, m15, plan):
 
 
 # ============================================================
+# 盯盘监控（价格区间 + 做空信号检测）
+# ============================================================
+
+def push_simple_alert(title, desp):
+    """简单ServerChan推送"""
+    if not SC_SENDKEY:
+        log("  ⚠️ SC_SENDKEY未配置，跳过推送")
+        return
+    try:
+        url = f"https://sctapi.ftqq.com/{SC_SENDKEY}.send"
+        data = urllib.parse.urlencode({
+            "title": title,
+            "desp": desp,
+            "tags": "做空信号",
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=data)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        if result.get("code") == 0:
+            log(f"  ✅ 盯盘推送成功")
+        else:
+            log(f"  ❌ 盯盘推送失败: {result}")
+    except Exception as e:
+        log(f"  ❌ 推送异常: {e}")
+
+
+def check_zone_short_signal():
+    """
+    监控 1.0895-1.1000 阻力区，检测做空信号
+    信号类型：Pin Bar / 看跌吞没 / 趋势柱失败
+    返回 True 如果检测到信号并推送
+    """
+    ZONE_LOW = 1.0895
+    ZONE_HIGH = 1.1000
+    # 去重标记文件
+    flag_file = os.path.join(OUTPUT_DIR, "last_short_alert.json")
+
+    log("🔍 检查盯盘条件（1.0895-1.1000阻力区做空信号）...")
+
+    # 拉取15M数据
+    m15_raw = fetch_candles("XRP-USDT", "15m", 20)
+    if not m15_raw:
+        log("  ⚠️ 15M数据拉取失败，跳过盯盘")
+        return False
+
+    candles = parse_candles(m15_raw)
+    last = candles[-1]
+    price = last["close"]
+    log(f"  当前价格: {price:.4f}")
+
+    # 检查是否在监控区间
+    in_zone = ZONE_LOW <= price <= ZONE_HIGH
+    approaching = ZONE_LOW - 0.01 <= price < ZONE_LOW
+
+    if not in_zone and not approaching:
+        log(f"  价格 {price:.4f} 不在监控区间附近 (需要 {ZONE_LOW}-{ZONE_HIGH})")
+        return False
+
+    if approaching:
+        log(f"  📡 价格接近监控区间: {price:.4f}")
+        return False
+
+    log(f"  📍 价格在监控区间内!")
+
+    # 检查最近两根完成的K线
+    if len(candles) < 3:
+        return False
+
+    c1 = candles[-3]  # 前一根
+    c2 = candles[-2]  # 最新完成的一根
+    current = candles[-1]  # 当前（可能未完成）
+
+    log(f"  前两根: {c1['dt']} O={c1['open']:.4f} C={c1['close']:.4f} | {c2['dt']} O={c2['open']:.4f} C={c2['close']:.4f}")
+
+    signals = []
+
+    # --- 信号1: Pin Bar ---
+    body = abs(c2["close"] - c2["open"])
+    upper_wick = c2["high"] - max(c2["close"], c2["open"])
+    lower_wick = min(c2["close"], c2["open"]) - c2["low"]
+    total_range = c2["high"] - c2["low"]
+
+    if total_range > 0 and upper_wick > total_range * 0.55 and body < total_range * 0.30 and c2["close"] < c2["open"]:
+        signals.append(("Pin Bar(倒锤子线)", c2))
+        log(f"  ✅ 检测到Pin Bar: 上影={upper_wick/total_range*100:.0f}% 实体占比={body/total_range*100:.0f}%")
+
+    # --- 信号2: 看跌吞没 ---
+    c1_bull = c1["close"] > c1["open"]
+    c2_bear = c2["close"] < c2["open"]
+    if c1_bull and c2_bear:
+        engulf = c2["open"] >= c1["close"] and c2["close"] <= c1["open"]
+        if engulf:
+            signals.append(("看跌吞没", c2))
+            log(f"  ✅ 检测到看跌吞没")
+
+    # --- 信号3: 趋势柱失败 ---
+    c1_body = abs(c1["close"] - c1["open"])
+    c1_range = c1["high"] - c1["low"]
+    c1_trend = c1_body > c1_range * 0.65 and c1["close"] > c1["open"]
+    c2_bear2 = c2["close"] < c2["open"]
+    if c1_trend and c2_bear2:
+        reversal = (c2["open"] >= c1["high"] and c2["close"] <= c1["low"]) or \
+                   (c2["open"] >= c1["close"] and c2["close"] <= c1["open"])
+        if reversal:
+            signals.append(("趋势柱失败", c2))
+            log(f"  ✅ 检测到趋势柱失败")
+
+    if not signals:
+        log(f"  ⏳ 在区间内但暂无做空信号")
+        return False
+
+    # 去重检查：读取上次推送时间
+    last_alert_ts = 0
+    try:
+        if os.path.exists(flag_file):
+            with open(flag_file, "r") as f:
+                last_data = json.load(f)
+            last_alert_ts = last_data.get("ts", 0)
+    except Exception:
+        pass
+
+    now_ts = datetime.now().timestamp()
+
+    for sig_type, sig_candle in signals:
+        # 冷却期 30 分钟
+        if now_ts - last_alert_ts < 1800:
+            log(f"  ⏸️ 冷却期内跳过推送")
+            return False
+
+        now_dt = datetime.now(timezone.utc).strftime("%m-%d %H:%M UTC")
+        title = f"🔴 XRP做空信号: {sig_type}"
+        desp = f"""# XRP-USDT 做空信号触发
+
+**信号类型**：{sig_type}
+
+**触发时间**：{now_dt}
+
+**当前价格**：{price:.4f}
+
+**K线时间**：{sig_candle['dt']}
+
+**K线详情**：O={sig_candle['open']:.4f} H={sig_candle['high']:.4f} L={sig_candle['low']:.4f} C={sig_candle['close']:.4f}
+
+---
+
+## 策略框架
+
+| 项目 | 内容 |
+|:---|:---|
+| 方向 | 做空（顺1H下跌趋势）|
+| 入场 | 信号K线收盘价附近 |
+| 止损 | 1.1010-1.1020（阻力区上方）|
+| 目标① | 1.0688（近期低点）|
+| 目标② | 1.0600（前波段扩展）|
+
+## 信号说明
+
+当前价格进入 **1.0895-1.1000** 阻力区，检测到 {sig_type}，表明上方抛压出现，做空条件满足。
+
+---
+*本信号由自动盯盘脚本生成，请结合自身判断执行*
+"""
+        push_simple_alert(title, desp)
+
+        # 记录推送时间
+        try:
+            with open(flag_file, "w") as f:
+                json.dump({"ts": now_ts, "signal": sig_type, "price": price}, f)
+        except Exception:
+            pass
+
+    return True
+
+
+# ============================================================
 # 主流程
 # ============================================================
 
@@ -1984,6 +2159,9 @@ def main():
         return
     m15_candles = parse_candles(m15_raw)
     log(f"  ✅ 15M: {len(m15_candles)}根, {m15_candles[0]['dt']} ~ {m15_candles[-1]['dt']}")
+
+    # 2.5 盯盘监控（阻力区做空信号检测）
+    check_zone_short_signal()
 
     # 3. 分析
     log("📊 执行1H趋势分析...")
