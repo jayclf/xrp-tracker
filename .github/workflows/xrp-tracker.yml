@@ -1,9 +1,9 @@
 name: XRP-USDT Price Action Tracker
 
 on:
-  schedule:
-    # 每5分钟执行一次 (UTC时间) - 盯盘模式
-    - cron: '*/5 * * * *'
+  # 定时任务已暂停，如需恢复请取消下面两行的注释
+  # schedule:
+  #   - cron: '*/5 * * * *'
   workflow_dispatch: # 支持手动触发
 
 jobs:
