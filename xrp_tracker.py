@@ -1995,48 +1995,86 @@ def check_zone_short_signal():
 
     log(f"  📍 价格在监控区间内!")
 
-    # 检查最近两根完成的K线
-    if len(candles) < 3:
+    # 检查最近几根K线（包括未完成的当前根）
+    if len(candles) < 4:
         return False
 
-    c1 = candles[-3]  # 前一根
-    c2 = candles[-2]  # 最新完成的一根
-    current = candles[-1]  # 当前（可能未完成）
+    c0 = candles[-3]  # 前两根
+    c1 = candles[-2]  # 前一根（已完成）
+    c2 = candles[-1]  # 当前根（可能未完成）
 
-    log(f"  前两根: {c1['dt']} O={c1['open']:.4f} C={c1['close']:.4f} | {c2['dt']} O={c2['open']:.4f} C={c2['close']:.4f}")
+    log(f"  最近3根K线:")
+    log(f"    {c0['dt']} O={c0['open']:.4f} H={c0['high']:.4f} L={c0['low']:.4f} C={c0['close']:.4f}")
+    log(f"    {c1['dt']} O={c1['open']:.4f} H={c1['high']:.4f} L={c1['low']:.4f} C={c1['close']:.4f}")
+    log(f"    {c2['dt']} O={c2['open']:.4f} H={c2['high']:.4f} L={c2['low']:.4f} C={c2['close']:.4f} (当前)")
 
     signals = []
 
-    # --- 信号1: Pin Bar ---
-    body = abs(c2["close"] - c2["open"])
-    upper_wick = c2["high"] - max(c2["close"], c2["open"])
-    lower_wick = min(c2["close"], c2["open"]) - c2["low"]
-    total_range = c2["high"] - c2["low"]
+    # ====== 对最新完成K线(c1)检测信号 ======
 
-    if total_range > 0 and upper_wick > total_range * 0.55 and body < total_range * 0.30 and c2["close"] < c2["open"]:
-        signals.append(("Pin Bar(倒锤子线)", c2))
-        log(f"  ✅ 检测到Pin Bar: 上影={upper_wick/total_range*100:.0f}% 实体占比={body/total_range*100:.0f}%")
+    # --- 信号1: Pin Bar / 长上影线（放宽条件）---
+    body1 = abs(c1["close"] - c1["open"])
+    upper_wick1 = c1["high"] - max(c1["close"], c1["open"])
+    lower_wick1 = min(c1["close"], c1["open"]) - c1["low"]
+    total_range1 = c1["high"] - c1["low"]
 
-    # --- 信号2: 看跌吞没 ---
-    c1_bull = c1["close"] > c1["open"]
-    c2_bear = c2["close"] < c2["open"]
-    if c1_bull and c2_bear:
-        engulf = c2["open"] >= c1["close"] and c2["close"] <= c1["open"]
-        if engulf:
-            signals.append(("看跌吞没", c2))
-            log(f"  ✅ 检测到看跌吞没")
+    if total_range1 > 0:
+        uw_pct1 = upper_wick1 / total_range1
+        body_pct1 = body1 / total_range1
+        # 放宽：上影线>45%，实体<40%
+        if uw_pct1 > 0.45 and body_pct1 < 0.40 and c1["close"] < c1["open"]:
+            signals.append(("Pin Bar(长上影线)", c1))
+            log(f"  ✅ 检测到Pin Bar: 上影={uw_pct1*100:.0f}% 实体={body_pct1*100:.0f}%")
 
-    # --- 信号3: 趋势柱失败 ---
-    c1_body = abs(c1["close"] - c1["open"])
-    c1_range = c1["high"] - c1["low"]
-    c1_trend = c1_body > c1_range * 0.65 and c1["close"] > c1["open"]
-    c2_bear2 = c2["close"] < c2["open"]
-    if c1_trend and c2_bear2:
-        reversal = (c2["open"] >= c1["high"] and c2["close"] <= c1["low"]) or \
-                   (c2["open"] >= c1["close"] and c2["close"] <= c1["open"])
-        if reversal:
-            signals.append(("趋势柱失败", c2))
+    # --- 信号2: 看跌吞没（放宽条件）---
+    c0_bull = c0["close"] > c0["open"]
+    c1_bear = c1["close"] < c1["open"]
+    if c0_bull and c1_bear:
+        # 严格吞没
+        engulf_strict = c1["open"] >= c0["close"] and c1["close"] <= c0["open"]
+        # 宽松吞没：c1实体覆盖c0实体
+        engulf_loose = c1["open"] >= c0["open"] and c1["close"] <= c0["close"]
+        if engulf_strict or engulf_loose:
+            signals.append(("看跌吞没", c1))
+            log(f"  ✅ 检测到看跌吞没: c0[{c0['open']:.4f}→{c0['close']:.4f}] c1[{c1['open']:.4f}→{c1['close']:.4f}]")
+
+    # --- 信号3: 趋势柱失败（放宽条件）---
+    c0_body = abs(c0["close"] - c0["open"])
+    c0_range = c0["high"] - c0["low"]
+    c0_trend = c0_body > c0_range * 0.55 and c0["close"] > c0["open"]  # 放宽到55%
+    if c0_trend and c1_bear:
+        reversal_strict = c1["open"] >= c0["high"] and c1["close"] <= c0["low"]
+        reversal_body = c1["open"] >= c0["close"] and c1["close"] <= c0["open"]
+        reversal_loose = c1["close"] < c0["open"]  # 至少跌回c0开盘价下方
+        if reversal_strict or reversal_body or reversal_loose:
+            signals.append(("趋势柱失败", c1))
             log(f"  ✅ 检测到趋势柱失败")
+
+    # --- 信号4: 连续阴线（新增）---
+    # 最近3根中至少2根阴线，且整体下行
+    bear_count = sum(1 for c in [c0, c1, c2] if c["close"] < c["open"])
+    if bear_count >= 2 and c1["close"] < c1["open"] and c2["close"] < c2["open"]:
+        # 价格从c0开盘到c2收盘下跌
+        if c2["close"] < c0["open"]:
+            signals.append(("连续阴线下跌", c2))
+            log(f"  ✅ 检测到连续阴线: {bear_count}/3根阴线")
+
+    # --- 信号5: 上影线拒绝（新增，检查当前未完成K线）---
+    # 即使当前K线未完成，如果已有明显上影线也预警
+    body2 = abs(c2["close"] - c2["open"])
+    upper_wick2 = c2["high"] - max(c2["close"], c2["open"])
+    total_range2 = c2["high"] - c2["low"]
+    if total_range2 > 0 and upper_wick2 > total_range2 * 0.50 and body2 < total_range2 * 0.40:
+        signals.append(("上影线拒绝(实时)", c2))
+        log(f"  ✅ 检测到上影线拒绝(实时): 上影={upper_wick2/total_range2*100:.0f}%")
+
+    # --- 信号6: 价格冲高回落（新增）---
+    # 当前K线高点接近区间上沿但收盘回落
+    if c2["high"] >= ZONE_HIGH - 0.002 and c2["close"] < c2["high"] - 0.003:
+        retreat_pct = (c2["high"] - c2["close"]) / max(c2["high"] - c2["low"], 0.001)
+        if retreat_pct > 0.5:
+            signals.append(("冲高回落", c2))
+            log(f"  ✅ 检测到冲高回落: 高点={c2['high']:.4f} 收盘={c2['close']:.4f} 回落={retreat_pct*100:.0f}%")
 
     if not signals:
         log(f"  ⏳ 在区间内但暂无做空信号")
@@ -2055,8 +2093,8 @@ def check_zone_short_signal():
     now_ts = datetime.now().timestamp()
 
     for sig_type, sig_candle in signals:
-        # 冷却期 30 分钟
-        if now_ts - last_alert_ts < 1800:
+        # 冷却期 15 分钟（与 Workflow 频率一致）
+        if now_ts - last_alert_ts < 900:
             log(f"  ⏸️ 冷却期内跳过推送")
             return False
 
